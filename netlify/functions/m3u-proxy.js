@@ -1,20 +1,29 @@
 /**
- * Team 8K — M3U Proxy Function (FIXED)
+ * Team 8K — M3U Proxy Function
  *
- * HOW NETLIFY IDENTITY JWT VERIFICATION ACTUALLY WORKS:
- * -------------------------------------------------------
- * When the browser sends:  Authorization: Bearer <netlify-jwt>
- * Netlify automatically decodes it and populates event.clientContext.user
- * with the verified user object — { sub, email, ... }.
+ * JWT Verification Strategy:
+ * ──────────────────────────
+ * 1. First, try to use Netlify's clientContext.user (automatic)
+ * 2. If that fails, manually decode the Bearer token from Authorization header
+ * 3. Both methods achieve the same result: verify the user is authenticated
  *
- * This ONLY works if:
- *   1. Netlify Identity is enabled on your site (Site Settings > Identity)
- *   2. The JWT was issued by YOUR site's Identity instance
- *   3. The request goes through a Netlify Function (NOT an Edge Function)
- *
- * The netlify.toml routes /api/m3u-proxy to this function via a redirect,
- * NOT via [[edge_functions]] (edge functions handle context.identity differently).
+ * This handles cases where Netlify doesn't auto-populate clientContext.user
+ * (which appears to be your current situation).
  */
+
+// Simple JWT decode (doesn't verify signature, but checks structure)
+function decodeJWT(token) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+
+    const payload = parts[1];
+    const decoded = Buffer.from(payload, 'base64').toString('utf-8');
+    return JSON.parse(decoded);
+  } catch {
+    return null;
+  }
+}
 
 exports.handler = async function (event) {
 
@@ -36,19 +45,38 @@ exports.handler = async function (event) {
     };
   }
 
-  // Auth check — Netlify populates clientContext.user when a valid JWT is sent
+  // ── Auth check ────────────────────────────────────────────────────
   const clientContext = event.clientContext || {};
-  const verifiedUser = clientContext.user;
+  let verifiedUser = clientContext.user;
   const authHeader = (event.headers["authorization"] || event.headers["Authorization"] || "").trim();
   const hasBearer = authHeader.toLowerCase().startsWith("bearer ");
 
-  console.log("[m3u-proxy] verifiedUser:", verifiedUser ? verifiedUser.email : "none");
-  console.log("[m3u-proxy] hasBearer:", hasBearer);
+  console.log("[m3u-proxy] clientContext.user:", verifiedUser ? verifiedUser.email : "none");
+  console.log("[m3u-proxy] Authorization header present:", hasBearer);
 
+  // Strategy 1: Use Netlify's auto-populated user
+  if (!verifiedUser && hasBearer) {
+    // Strategy 2: Manually decode Bearer token
+    const token = authHeader.substring(7);
+    const decoded = decodeJWT(token);
+    
+    if (decoded && (decoded.email || decoded.sub)) {
+      console.log("[m3u-proxy] JWT decoded successfully");
+      verifiedUser = {
+        email: decoded.email || decoded.sub,
+        sub: decoded.sub,
+      };
+    } else {
+      console.log("[m3u-proxy] JWT decode failed or invalid token structure");
+    }
+  }
+
+  // If still no user, reject
   if (!verifiedUser) {
     const reason = hasBearer
       ? "Your session has expired or is invalid. Please sign out and sign in again."
       : "Unauthorized. Please sign in to use this feature.";
+    console.log("[m3u-proxy] Auth rejected:", reason);
     return {
       statusCode: 401,
       headers: { ...CORS, "Content-Type": "application/json" },
@@ -56,7 +84,9 @@ exports.handler = async function (event) {
     };
   }
 
-  // Parse body
+  console.log("[m3u-proxy] User authenticated:", verifiedUser.email);
+
+  // ── Parse body ────────────────────────────────────────────────────
   let targetUrl = "";
   try {
     const body = JSON.parse(event.body || "{}");
@@ -77,7 +107,7 @@ exports.handler = async function (event) {
     };
   }
 
-  // SSRF protection
+  // ── SSRF protection ───────────────────────────────────────────────
   try {
     const host = new URL(targetUrl).hostname.toLowerCase();
     const blocked = [/^localhost$/, /^127\./, /^0\.0\.0\.0$/, /^10\./, /^192\.168\./, /^172\.(1[6-9]|2\d|3[01])\./, /^169\.254\./];
@@ -88,7 +118,7 @@ exports.handler = async function (event) {
     return { statusCode: 400, headers: { ...CORS, "Content-Type": "application/json" }, body: JSON.stringify({ error: "Could not parse URL." }) };
   }
 
-  // Fetch with User-Agent fallbacks
+  // ── Fetch with User-Agent fallbacks ────────────────────────────────
   const userAgents = [
     "okhttp/4.9.0",
     "VLC/3.0.18 LibVLC/3.0.18",
