@@ -186,7 +186,7 @@ export const LoaderPanel = ({ onLoad }: Props) => {
                 if (f) await handleFile(f);
               }}
               onClick={() => fileRef.current?.click()}
-              className="cursor-pointer rounded-xl border border-dashed border-border/70 hover:border-primary/60 hover:bg-primary/5 transition-smooth py-10 px-6 flex flex-col items-center justify-center text-center"
+              className="cursor-pointer rounded-xl border border-dashed border-border/70 hover:border-primary/60 hover:bg-primary/5 transition-smooth py-10 px-6 flex flex-col items-center justify-center"
             >
               <div className="h-14 w-14 rounded-full bg-muted/40 border border-border/60 flex items-center justify-center mb-4">
                 <Upload className="h-5 w-5 text-foreground/80" />
@@ -212,8 +212,8 @@ export const LoaderPanel = ({ onLoad }: Props) => {
               <div className="flex items-start gap-3 rounded-xl border border-primary/20 bg-primary/5 px-4 py-3">
                 <Shield className="h-4 w-4 text-primary mt-0.5 shrink-0" />
                 <p className="text-xs text-muted-foreground leading-relaxed">
-                  Your credentials are sent directly to your IPTV provider via a secure proxy.
-                  Nothing is logged or stored.
+                  Your IPTV provider credentials are sent securely to your provider via our proxy.
+                  Your app login credentials are never used. Nothing is logged or stored.
                 </p>
               </div>
 
@@ -280,7 +280,7 @@ export const LoaderPanel = ({ onLoad }: Props) => {
               <div className="flex items-start gap-3 rounded-xl border border-primary/20 bg-primary/5 px-4 py-3">
                 <Link className="h-4 w-4 text-primary mt-0.5 shrink-0" />
                 <p className="text-xs text-muted-foreground leading-relaxed">
-                  Paste your full M3U URL. Fetched via a secure proxy to bypass browser restrictions.
+                  Paste your full M3U URL with embedded IPTV credentials. Fetched via a secure proxy to bypass browser restrictions.
                   Nothing is stored.
                 </p>
               </div>
@@ -312,7 +312,7 @@ export const LoaderPanel = ({ onLoad }: Props) => {
           <span>
             {mode === "file"
               ? "100% Client-side. Your playlist never leaves your device."
-              : "Fetched via secure proxy. Credentials are never logged or stored."}
+              : "IPTV credentials sent securely to provider. App login never used for playlists."}
           </span>
         </div>
       </div>
