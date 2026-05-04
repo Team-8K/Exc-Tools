@@ -3,6 +3,7 @@ import { Upload, Shield, Link } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { toast } from "sonner";
+import { getUser } from "@netlify/identity";
 
 interface Props {
   onLoad: (content: string, source: string) => void;
@@ -10,18 +11,17 @@ interface Props {
 
 type Mode = "file" | "xtream" | "url";
 
-// Get Netlify Identity JWT token from the logged-in user.
-// Pass true to force-refresh — this guarantees the token is never expired
-// when it reaches the Netlify Function, which is the #1 cause of 401 errors.
+// Get Netlify Identity JWT for the current session.
+// @netlify/identity manages token refresh automatically.
 const getIdentityToken = async (): Promise<string> => {
-  const user = window.netlifyIdentity?.currentUser();
-  if (!user) return "";
   try {
-    // force=true refreshes the token if it's within 60s of expiry
-    return await user.jwt(true);
+    const user = await getUser();
+    if (!user) return "";
+    // Access the raw token from the user object
+    const u = user as any;
+    return u.accessToken ?? u.token?.access_token ?? "";
   } catch {
-    // If refresh fails (network issue), try the cached token
-    try { return await user.jwt(); } catch { return ""; }
+    return "";
   }
 };
 
