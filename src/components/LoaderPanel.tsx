@@ -3,7 +3,7 @@ import { Upload, Shield, Link } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { toast } from "sonner";
-import { getUser } from "@netlify/identity";
+import { getUser, refreshSession } from "@netlify/identity";
 
 interface Props {
   onLoad: (content: string, source: string) => void;
@@ -11,15 +11,34 @@ interface Props {
 
 type Mode = "file" | "xtream" | "url";
 
-// Get Netlify Identity JWT for the current session.
-// @netlify/identity manages token refresh automatically.
+// Get the Netlify Identity JWT for the current session.
+// The library does NOT expose the token on the User object — it lives in the
+// `nf_jwt` cookie (set on login) and in the `gotrue.user` localStorage entry.
+// We also call refreshSession() so a near-expired token is rotated before use.
 const getIdentityToken = async (): Promise<string> => {
   try {
     const user = await getUser();
     if (!user) return "";
-    // Access the raw token from the user object
-    const u = user as any;
-    return u.accessToken ?? u.token?.access_token ?? "";
+
+    // refreshSession() returns the rotated JWT, or null when no refresh is needed.
+    const rotated = await refreshSession().catch(() => null);
+    if (rotated) return rotated;
+
+    // Cookie set by login() / refresh.
+    const match = typeof document !== "undefined"
+      ? document.cookie.match(/(?:^|; )nf_jwt=([^;]*)/)
+      : null;
+    if (match) {
+      try { return decodeURIComponent(match[1]); } catch { return match[1]; }
+    }
+
+    // Fallback: gotrue-js persists the session here, including the access token.
+    const stored = typeof localStorage !== "undefined" ? localStorage.getItem("gotrue.user") : null;
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      return parsed?.token?.access_token ?? "";
+    }
+    return "";
   } catch {
     return "";
   }
