@@ -10,13 +10,7 @@ interface Props {
 
 type Mode = "file" | "xtream" | "url";
 
-// Get Netlify Identity JWT token from the logged-in user
-const getIdentityToken = async (): Promise<string> => {
-  const user = window.netlifyIdentity?.currentUser();
-  if (!user) return "";
-  // Refresh token if needed and return JWT
-  return await user.jwt();
-};
+
 
 export const LoaderPanel = ({ onLoad }: Props) => {
   const fileRef = useRef<HTMLInputElement>(null);
@@ -49,17 +43,10 @@ export const LoaderPanel = ({ onLoad }: Props) => {
   const fetchViaProxy = async (body: Record<string, string>, sourceName: string) => {
     setLoading(true);
     try {
-      const token = await getIdentityToken();
-      if (!token) {
-        toast.error("Not authenticated. Please sign in and try again.");
-        return;
-      }
-
       const res = await fetch("/api/m3u-proxy", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`,
         },
         body: JSON.stringify(body),
       });
