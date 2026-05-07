@@ -1,2 +1,1 @@
-# SPA redirect — handled by netlify.toml to avoid intercepting /.netlify/* endpoints
-# DO NOT add a catch-all here; it would block Netlify Identity's settings endpoint
+/*    /index.html   200

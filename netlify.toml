@@ -6,21 +6,9 @@
 [build.environment]
   NODE_VERSION = "22"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# IMPORTANT: There is NO [[edge_functions]] block here.
-#
-# Edge Functions do NOT reliably populate clientContext.user for Netlify Identity.
-# The regular Netlify Function (netlify/functions/m3u-proxy.js) DOES, because
-# Netlify automatically decodes the Authorization: Bearer <jwt> header and
-# injects the verified user into event.clientContext.user.
-#
-# The redirect below routes /api/m3u-proxy → /.netlify/functions/m3u-proxy
-# ─────────────────────────────────────────────────────────────────────────────
-
-[[redirects]]
-  from   = "/api/m3u-proxy"
-  to     = "/.netlify/functions/m3u-proxy"
-  status = 200
+[[edge_functions]]
+  path     = "/api/m3u-proxy"
+  function = "m3u-proxy-edge"
 
 [[headers]]
   for = "/*"

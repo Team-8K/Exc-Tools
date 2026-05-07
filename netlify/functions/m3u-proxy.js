@@ -1,73 +1,22 @@
 /**
  * Team 8K — M3U Proxy Function
- *
- * Fetches M3U/Xtream playlists server-side to bypass CORS restrictions.
- * Tries multiple URL variants and User-Agent strings for maximum compatibility.
+ * Protected with Netlify Identity JWT
  */
-
-function decodeJWT(token) {
-  try {
-    const parts = token.split(".");
-    if (parts.length !== 3) return null;
-    // Fix base64url padding
-    const payload = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    const decoded = Buffer.from(payload, "base64").toString("utf-8");
-    return JSON.parse(decoded);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Build URL variants to try for Xtream Codes compatibility.
- * Different providers require different type/output combinations.
- */
-function buildUrlVariants(originalUrl) {
-  try {
-    const u = new URL(originalUrl);
-
-    // If this doesn't look like a get.php Xtream URL, just return as-is
-    if (!u.pathname.includes("get.php") && !u.searchParams.has("username")) {
-      return [originalUrl];
-    }
-
-    const base = `${u.protocol}//${u.host}${u.pathname}`;
-    const username = u.searchParams.get("username") || "";
-    const password = u.searchParams.get("password") || "";
-
-    if (!username) return [originalUrl];
-
-    const enc = encodeURIComponent;
-    const creds = `username=${enc(username)}&password=${enc(password)}`;
-
-    return [
-      // Most compatible: m3u_plus with ts
-      `${base}?${creds}&type=m3u_plus&output=ts`,
-      // m3u_plus without output (many providers)
-      `${base}?${creds}&type=m3u_plus`,
-      // m3u_plus with mpegts
-      `${base}?${creds}&type=m3u_plus&output=mpegts`,
-      // Plain m3u
-      `${base}?${creds}&type=m3u`,
-      // Original as last resort
-      originalUrl,
-    ].filter((v, i, arr) => arr.indexOf(v) === i);
-  } catch {
-    return [originalUrl];
-  }
-}
-
-const CORS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
-};
 
 exports.handler = async function (event) {
+
+  const CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  };
+
+  // CORS preflight
   if (event.httpMethod === "OPTIONS") {
     return { statusCode: 204, headers: CORS, body: "" };
   }
 
+  // Only POST allowed
   if (event.httpMethod !== "POST") {
     return {
       statusCode: 405,
@@ -76,32 +25,26 @@ exports.handler = async function (event) {
     };
   }
 
-  // ── Auth check ────────────────────────────────────────────────────
+  // ── Identity check ────────────────────────────────────────────
+  // Netlify populates clientContext.user when Authorization: Bearer <jwt> is present
+  // Log what we receive to debug
   const clientContext = event.clientContext || {};
-  let verifiedUser = clientContext.user;
-  const authHeader = (event.headers["authorization"] || event.headers["Authorization"] || "").trim();
-  const hasBearer = authHeader.toLowerCase().startsWith("bearer ");
+  const user = clientContext.user;
+  const authHeader = event.headers["authorization"] || event.headers["Authorization"] || "";
 
-  if (!verifiedUser && hasBearer) {
-    const token = authHeader.substring(7);
-    const decoded = decodeJWT(token);
-    if (decoded && (decoded.email || decoded.sub)) {
-      verifiedUser = { email: decoded.email || decoded.sub, sub: decoded.sub };
-    }
-  }
+  console.log("clientContext keys:", Object.keys(clientContext));
+  console.log("user present:", !!user);
+  console.log("auth header present:", !!authHeader);
 
-  if (!verifiedUser) {
-    const reason = hasBearer
-      ? "Your session has expired or is invalid. Please sign out and sign in again."
-      : "Unauthorized. Please sign in to use this feature.";
+  if (!user && !authHeader.startsWith("Bearer ")) {
     return {
       statusCode: 401,
       headers: { ...CORS, "Content-Type": "application/json" },
-      body: JSON.stringify({ error: reason }),
+      body: JSON.stringify({ error: "Unauthorized. Please log in to use this feature." }),
     };
   }
 
-  // ── Parse body ────────────────────────────────────────────────────
+  // ── Parse body ────────────────────────────────────────────────
   let targetUrl = "";
   try {
     const body = JSON.parse(event.body || "{}");
@@ -114,153 +57,94 @@ exports.handler = async function (event) {
     };
   }
 
-  if (!targetUrl || !/^https?:\/\/.+/.test(targetUrl)) {
+  if (!targetUrl) {
     return {
       statusCode: 400,
       headers: { ...CORS, "Content-Type": "application/json" },
-      body: JSON.stringify({ error: "Invalid or missing URL" }),
+      body: JSON.stringify({ error: "Missing 'url' in request body" }),
     };
   }
 
-  // ── SSRF protection ───────────────────────────────────────────────
-  try {
-    const host = new URL(targetUrl).hostname.toLowerCase();
-    const blocked = [
-      /^localhost$/,
-      /^127\./,
-      /^0\.0\.0\.0$/,
-      /^10\./,
-      /^192\.168\./,
-      /^172\.(1[6-9]|2\d|3[01])\./,
-      /^169\.254\./,
-      /^::1$/,
-    ];
-    if (blocked.some((r) => r.test(host))) {
-      return {
-        statusCode: 400,
-        headers: { ...CORS, "Content-Type": "application/json" },
-        body: JSON.stringify({ error: "Private IP addresses are not allowed." }),
-      };
-    }
-  } catch {
+  if (!/^https?:\/\/.+/.test(targetUrl)) {
     return {
       statusCode: 400,
       headers: { ...CORS, "Content-Type": "application/json" },
-      body: JSON.stringify({ error: "Could not parse URL." }),
+      body: JSON.stringify({ error: "Invalid URL. Must start with http:// or https://" }),
     };
   }
 
-  const urlVariants = buildUrlVariants(targetUrl);
-
+  // ── Fetch with multiple User-Agent fallbacks ──────────────────
   const userAgents = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36",
-    "VLC/3.0.20 LibVLC/3.0.20",
+    "okhttp/4.9.0",
+    "VLC/3.0.18 LibVLC/3.0.18",
     "Tivimate/4.7.0",
-    "okhttp/4.12.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
   ];
 
   let lastError = "";
-  let credentialError = null;
 
-  for (const url of urlVariants) {
-    for (const ua of userAgents) {
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 40000);
+  for (const ua of userAgents) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 20000);
 
-        const upstream = await fetch(url, {
-          method: "GET",
-          headers: {
-            "User-Agent": ua,
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-          },
-          redirect: "follow",
-          signal: controller.signal,
-        });
+      const upstream = await fetch(targetUrl, {
+        method: "GET",
+        headers: {
+          "User-Agent": ua,
+          "Accept": "*/*",
+          "Accept-Encoding": "identity",
+          "Connection": "keep-alive",
+        },
+        redirect: "follow",
+        signal: controller.signal,
+      });
 
-        clearTimeout(timer);
+      clearTimeout(timer);
 
-        // Credential rejection — no point retrying other UAs
-        if (upstream.status === 401 || upstream.status === 403) {
-          credentialError = `Your IPTV provider rejected the credentials (HTTP ${upstream.status}). Please verify your username and password.`;
-          break;
-        }
-
-        if (upstream.status >= 400) {
-          lastError = `Server returned HTTP ${upstream.status}`;
-          continue;
-        }
-
-        const text = await upstream.text();
-
-        if (!text || text.trim().length === 0) {
-          lastError = "Empty response from server";
-          continue;
-        }
-
-        // Check for Xtream JSON auth failure
-        try {
-          const json = JSON.parse(text);
-          if (json && json.user_info && json.user_info.auth === 0) {
-            credentialError = "Your IPTV provider rejected the credentials. Please verify your username and password.";
-            break;
-          }
-        } catch {
-          // Not JSON — that's fine, continue to M3U check
-        }
-
-        if (text.includes("#EXTM3U") || text.includes("#EXTINF")) {
-          const channelCount = (text.match(/#EXTINF/g) || []).length;
-          console.log(`[m3u-proxy] OK: ${channelCount} channels via ${url.split("?")[0]} for ${verifiedUser.email}`);
-          return {
-            statusCode: 200,
-            headers: {
-              ...CORS,
-              "Content-Type": "audio/x-mpegurl; charset=utf-8",
-              "Cache-Control": "no-store, no-cache",
-            },
-            body: text,
-          };
-        }
-
-        lastError = `Not a valid M3U. Response preview: ${text.slice(0, 200)}`;
-        // Non-M3U response for this URL variant — try next variant, skip remaining UAs
-        break;
-      } catch (err) {
-        clearTimeout && clearTimeout();
-        if (err.name === "AbortError") {
-          return {
-            statusCode: 504,
-            headers: { ...CORS, "Content-Type": "application/json" },
-            body: JSON.stringify({
-              error: "Request timed out after 40 seconds. Your IPTV server may be slow or unreachable.",
-            }),
-          };
-        }
-        lastError = err.message;
+      if (upstream.status >= 400) {
+        lastError = `Server returned HTTP ${upstream.status}`;
         continue;
       }
-    }
 
-    if (credentialError) {
+      const text = await upstream.text();
+
+      if (!text.includes("#EXTM3U") && !text.includes("#EXTINF")) {
+        return {
+          statusCode: 422,
+          headers: { ...CORS, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            error: `Server did not return a valid M3U. Server said: ${text.slice(0, 300)}`,
+          }),
+        };
+      }
+
       return {
-        statusCode: 401,
-        headers: { ...CORS, "Content-Type": "application/json" },
-        body: JSON.stringify({ error: credentialError }),
+        statusCode: 200,
+        headers: {
+          ...CORS,
+          "Content-Type": "audio/x-mpegurl; charset=utf-8",
+          "Cache-Control": "no-store, no-cache",
+        },
+        body: text,
       };
+
+    } catch (err) {
+      if (err.name === "AbortError") {
+        return {
+          statusCode: 504,
+          headers: { ...CORS, "Content-Type": "application/json" },
+          body: JSON.stringify({ error: "Request timed out after 20 seconds." }),
+        };
+      }
+      lastError = err.message;
+      continue;
     }
   }
 
   return {
     statusCode: 502,
     headers: { ...CORS, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      error: `Could not retrieve a valid playlist. Last error: ${lastError}`,
-    }),
+    body: JSON.stringify({ error: `Could not reach your IPTV server. Last error: ${lastError}` }),
   };
 };
