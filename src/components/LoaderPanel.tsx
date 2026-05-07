@@ -3,7 +3,6 @@ import { Upload, Shield, Link } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { toast } from "sonner";
-import { getUser, refreshSession } from "@netlify/identity";
 
 interface Props {
   onLoad: (content: string, source: string) => void;
@@ -11,38 +10,7 @@ interface Props {
 
 type Mode = "file" | "xtream" | "url";
 
-// Get the Netlify Identity JWT for the current session.
-// The library does NOT expose the token on the User object — it lives in the
-// `nf_jwt` cookie (set on login) and in the `gotrue.user` localStorage entry.
-// We also call refreshSession() so a near-expired token is rotated before use.
-const getIdentityToken = async (): Promise<string> => {
-  try {
-    const user = await getUser();
-    if (!user) return "";
 
-    // refreshSession() returns the rotated JWT, or null when no refresh is needed.
-    const rotated = await refreshSession().catch(() => null);
-    if (rotated) return rotated;
-
-    // Cookie set by login() / refresh.
-    const match = typeof document !== "undefined"
-      ? document.cookie.match(/(?:^|; )nf_jwt=([^;]*)/)
-      : null;
-    if (match) {
-      try { return decodeURIComponent(match[1]); } catch { return match[1]; }
-    }
-
-    // Fallback: gotrue-js persists the session here, including the access token.
-    const stored = typeof localStorage !== "undefined" ? localStorage.getItem("gotrue.user") : null;
-    if (stored) {
-      const parsed = JSON.parse(stored);
-      return parsed?.token?.access_token ?? "";
-    }
-    return "";
-  } catch {
-    return "";
-  }
-};
 
 export const LoaderPanel = ({ onLoad }: Props) => {
   const fileRef = useRef<HTMLInputElement>(null);
@@ -72,22 +40,15 @@ export const LoaderPanel = ({ onLoad }: Props) => {
   };
 
   // ── Proxy fetch — POST with Identity JWT ──────────────────────
-  const fetchViaProxy = async (targetUrl: string, sourceName: string) => {
+  const fetchViaProxy = async (body: Record<string, string>, sourceName: string) => {
     setLoading(true);
     try {
-      const token = await getIdentityToken();
-      if (!token) {
-        toast.error("Not authenticated. Please sign in and try again.");
-        return;
-      }
-
       const res = await fetch("/api/m3u-proxy", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`,
         },
-        body: JSON.stringify({ url: targetUrl }),
+        body: JSON.stringify(body),
       });
 
       const text = await res.text();
@@ -124,8 +85,7 @@ export const LoaderPanel = ({ onLoad }: Props) => {
       return;
     }
 
-    const targetUrl = `${host}/get.php?username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}&type=m3u_plus&output=ts`;
-    await fetchViaProxy(targetUrl, host.replace(/^https?:\/\//, ""));
+    await fetchViaProxy({ host, username: user, password: pass }, host.replace(/^https?:\/\//, ""));
   };
 
   // ── M3U URL submit ────────────────────────────────────────────
@@ -139,7 +99,7 @@ export const LoaderPanel = ({ onLoad }: Props) => {
       toast.error("URL must start with http:// or https://");
       return;
     }
-    await fetchViaProxy(url, "Remote playlist");
+    await fetchViaProxy({ url }, "Remote playlist");
   };
 
   const tabs: { id: Mode; label: string }[] = [
