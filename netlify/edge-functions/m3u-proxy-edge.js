@@ -23,15 +23,6 @@ export default async (request, context) => {
     });
   }
 
-  // Identity check
-  const user = context.identity?.user;
-  const authHeader = request.headers.get("Authorization") || "";
-  if (!user && !authHeader.startsWith("Bearer ")) {
-    return new Response(JSON.stringify({ error: "Unauthorized. Please log in." }), {
-      status: 401, headers: { ...CORS, "Content-Type": "application/json" },
-    });
-  }
-
   // Parse body
   let host, username, password, url;
   try {
