@@ -1,9 +1,9 @@
 import { useRef, useState } from "react";
-import { Upload, Shield, Link } from "lucide-react";
+import { Upload, Shield, Link, CircleAlert as AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { toast } from "sonner";
-import { getUser, refreshSession } from "@netlify/identity";
+import { getUser } from "@netlify/identity";
 
 interface Props {
   onLoad: (content: string, source: string) => void;
@@ -11,33 +11,48 @@ interface Props {
 
 type Mode = "file" | "xtream" | "url";
 
-// Get the Netlify Identity JWT for the current session.
-// The library does NOT expose the token on the User object — it lives in the
-// `nf_jwt` cookie (set on login) and in the `gotrue.user` localStorage entry.
-// We also call refreshSession() so a near-expired token is rotated before use.
+/**
+ * Retrieve the Netlify Identity JWT for the current session.
+ *
+ * gotrue-js (used by @netlify/identity) stores the session in localStorage.
+ * The @netlify/identity wrapper does not expose the raw access token on the
+ * User object, so we read it directly from storage.
+ */
 const getIdentityToken = async (): Promise<string> => {
   try {
     const user = await getUser();
     if (!user) return "";
 
-    // refreshSession() returns the rotated JWT, or null when no refresh is needed.
-    const rotated = await refreshSession().catch(() => null);
-    if (rotated) return rotated;
+    // gotrue-js stores the session under one of these keys
+    const storageKeys = ["gotrue.user", "netlify-cms-user", "netlify_identity_user"];
 
-    // Cookie set by login() / refresh.
-    const match = typeof document !== "undefined"
-      ? document.cookie.match(/(?:^|; )nf_jwt=([^;]*)/)
-      : null;
+    for (const key of storageKeys) {
+      try {
+        const stored = localStorage.getItem(key);
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          const token =
+            parsed?.token?.access_token ||
+            parsed?.access_token ||
+            parsed?.jwt ||
+            "";
+          if (token) return token;
+        }
+      } catch {
+        // continue to next key
+      }
+    }
+
+    // Fallback: nf_jwt cookie set by Netlify on login
+    const match = document.cookie.match(/(?:^|; )nf_jwt=([^;]*)/);
     if (match) {
-      try { return decodeURIComponent(match[1]); } catch { return match[1]; }
+      try {
+        return decodeURIComponent(match[1]);
+      } catch {
+        return match[1];
+      }
     }
 
-    // Fallback: gotrue-js persists the session here, including the access token.
-    const stored = typeof localStorage !== "undefined" ? localStorage.getItem("gotrue.user") : null;
-    if (stored) {
-      const parsed = JSON.parse(stored);
-      return parsed?.token?.access_token ?? "";
-    }
     return "";
   } catch {
     return "";
@@ -56,8 +71,9 @@ export const LoaderPanel = ({ onLoad }: Props) => {
   // M3U URL field
   const [m3uUrl, setM3uUrl] = useState("");
 
-  // Loading state
+  // Loading + error state
   const [loading, setLoading] = useState(false);
+  const [fetchError, setFetchError] = useState("");
 
   // ── File handler ──────────────────────────────────────────────
   const handleFile = async (file: File) => {
@@ -71,13 +87,16 @@ export const LoaderPanel = ({ onLoad }: Props) => {
     toast.success(`Loaded ${file.name}`);
   };
 
-  // ── Proxy fetch — POST with Identity JWT ──────────────────────
+  // ── Proxy fetch ───────────────────────────────────────────────
   const fetchViaProxy = async (targetUrl: string, sourceName: string) => {
     setLoading(true);
+    setFetchError("");
     try {
       const token = await getIdentityToken();
       if (!token) {
-        toast.error("Not authenticated. Please sign in and try again.");
+        const msg = "Could not retrieve your session token. Please sign out and sign in again.";
+        setFetchError(msg);
+        toast.error(msg);
         return;
       }
 
@@ -94,16 +113,24 @@ export const LoaderPanel = ({ onLoad }: Props) => {
 
       if (!res.ok) {
         let msg = "Failed to load playlist.";
-        try { msg = JSON.parse(text).error || msg; } catch { /* not JSON */ }
+        try {
+          msg = JSON.parse(text).error || msg;
+        } catch {
+          // not JSON
+        }
+        setFetchError(msg);
         toast.error(msg);
         return;
       }
 
+      setFetchError("");
       onLoad(text, sourceName);
       const count = (text.match(/#EXTINF/g) || []).length;
       toast.success(`Loaded ${count.toLocaleString()} channels from ${sourceName}`);
     } catch {
-      toast.error("Network error — check your connection and try again.");
+      const msg = "Network error — check your connection and try again.";
+      setFetchError(msg);
+      toast.error(msg);
     } finally {
       setLoading(false);
     }
@@ -111,7 +138,7 @@ export const LoaderPanel = ({ onLoad }: Props) => {
 
   // ── Xtream Codes submit ───────────────────────────────────────
   const handleXtream = async () => {
-    const host = xHost.trim().replace(/\/$/, "");
+    const host = xHost.trim().replace(/\/+$/, "");
     const user = xUser.trim();
     const pass = xPass.trim();
 
@@ -120,12 +147,14 @@ export const LoaderPanel = ({ onLoad }: Props) => {
       return;
     }
     if (!/^https?:\/\/.+/.test(host)) {
-      toast.error("Host must start with http:// or https://");
+      toast.error("Server URL must start with http:// or https://");
       return;
     }
 
+    // The proxy will automatically try multiple type/output variants
     const targetUrl = `${host}/get.php?username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}&type=m3u_plus&output=ts`;
-    await fetchViaProxy(targetUrl, host.replace(/^https?:\/\//, ""));
+    const sourceName = host.replace(/^https?:\/\//, "").split("/")[0];
+    await fetchViaProxy(targetUrl, sourceName);
   };
 
   // ── M3U URL submit ────────────────────────────────────────────
@@ -160,7 +189,7 @@ export const LoaderPanel = ({ onLoad }: Props) => {
               <button
                 key={t.id}
                 type="button"
-                onClick={() => setMode(t.id)}
+                onClick={() => { setMode(t.id); setFetchError(""); }}
                 className={`flex-1 px-4 py-4 flex items-center justify-center gap-2 text-xs md:text-sm font-display font-bold uppercase tracking-[0.2em] transition-smooth border-b-2 ${
                   active
                     ? "text-primary border-primary bg-primary/5"
@@ -175,6 +204,14 @@ export const LoaderPanel = ({ onLoad }: Props) => {
 
         {/* Content */}
         <div className="p-6 md:p-8">
+
+          {/* Error banner */}
+          {fetchError && (
+            <div className="flex items-start gap-3 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 mb-5">
+              <AlertCircle className="h-4 w-4 text-red-400 mt-0.5 shrink-0" />
+              <p className="text-xs text-red-300 leading-relaxed">{fetchError}</p>
+            </div>
+          )}
 
           {/* LOCAL FILE */}
           {mode === "file" && (
@@ -192,7 +229,7 @@ export const LoaderPanel = ({ onLoad }: Props) => {
                 <Upload className="h-5 w-5 text-foreground/80" />
               </div>
               <h3 className="font-display font-bold text-lg mb-1">Upload Playlist File</h3>
-              <p className="text-sm text-muted-foreground">
+              <p className="text-sm text-muted-foreground text-center">
                 Drag and drop your .m3u or .m3u8 file here,
                 <br />or click to browse.
               </p>
@@ -212,8 +249,9 @@ export const LoaderPanel = ({ onLoad }: Props) => {
               <div className="flex items-start gap-3 rounded-xl border border-primary/20 bg-primary/5 px-4 py-3">
                 <Shield className="h-4 w-4 text-primary mt-0.5 shrink-0" />
                 <p className="text-xs text-muted-foreground leading-relaxed">
-                  Your IPTV provider credentials are sent securely to your provider via our proxy.
-                  Your app login credentials are never used. Nothing is logged or stored.
+                  Enter your <strong className="text-foreground">IPTV provider</strong> credentials — these are completely
+                  separate from your Team 8K login. Your IPTV provider supplies you with
+                  a server URL, username, and password. Nothing is stored or logged.
                 </p>
               </div>
 
@@ -223,7 +261,7 @@ export const LoaderPanel = ({ onLoad }: Props) => {
                 </label>
                 <Input
                   type="url"
-                  placeholder="http://cf.yourprovider.com"
+                  placeholder="http://your-provider.com:8080"
                   value={xHost}
                   onChange={(e) => setXHost(e.target.value)}
                   className="bg-background/60 border-border focus-visible:ring-primary font-mono text-sm"
@@ -234,11 +272,11 @@ export const LoaderPanel = ({ onLoad }: Props) => {
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs text-muted-foreground uppercase tracking-widest mb-1.5">
-                    Username
+                    IPTV Username
                   </label>
                   <Input
                     type="text"
-                    placeholder="your_username"
+                    placeholder="your_iptv_user"
                     value={xUser}
                     onChange={(e) => setXUser(e.target.value)}
                     autoComplete="off"
@@ -248,11 +286,11 @@ export const LoaderPanel = ({ onLoad }: Props) => {
                 </div>
                 <div>
                   <label className="block text-xs text-muted-foreground uppercase tracking-widest mb-1.5">
-                    Password
+                    IPTV Password
                   </label>
                   <Input
                     type="password"
-                    placeholder="your_password"
+                    placeholder="your_iptv_pass"
                     value={xPass}
                     onChange={(e) => setXPass(e.target.value)}
                     autoComplete="off"
@@ -264,12 +302,12 @@ export const LoaderPanel = ({ onLoad }: Props) => {
 
               {xHost && xUser && (
                 <p className="text-xs text-muted-foreground font-mono bg-background/40 rounded-lg px-3 py-2 truncate">
-                  → {xHost.replace(/\/$/, "")}/get.php?username={xUser}&password=••••••&type=m3u_plus
+                  {xHost.replace(/\/+$/, "")}/get.php?username={xUser}&password=••••••&type=m3u_plus
                 </p>
               )}
 
               <Button variant="gold" className="w-full" onClick={handleXtream} disabled={loading}>
-                {loading ? "Loading playlist…" : "Load My Playlist"}
+                {loading ? "Fetching playlist…" : "Load My Playlist"}
               </Button>
             </div>
           )}
@@ -280,8 +318,9 @@ export const LoaderPanel = ({ onLoad }: Props) => {
               <div className="flex items-start gap-3 rounded-xl border border-primary/20 bg-primary/5 px-4 py-3">
                 <Link className="h-4 w-4 text-primary mt-0.5 shrink-0" />
                 <p className="text-xs text-muted-foreground leading-relaxed">
-                  Paste your full M3U URL with embedded IPTV credentials. Fetched via a secure proxy to bypass browser restrictions.
-                  Nothing is stored.
+                  Paste your full M3U URL from your <strong className="text-foreground">IPTV provider</strong> — not your
+                  Team 8K login. The URL is fetched via a secure server-side proxy to
+                  bypass browser restrictions. Nothing is stored.
                 </p>
               </div>
 
@@ -291,7 +330,7 @@ export const LoaderPanel = ({ onLoad }: Props) => {
                 </label>
                 <Input
                   type="url"
-                  placeholder="http://cf.yourprovider.com/get.php?username=...&password=..."
+                  placeholder="http://your-provider.com/get.php?username=...&password=..."
                   value={m3uUrl}
                   onChange={(e) => setM3uUrl(e.target.value)}
                   className="bg-background/60 border-border focus-visible:ring-primary font-mono text-sm"
@@ -300,7 +339,7 @@ export const LoaderPanel = ({ onLoad }: Props) => {
               </div>
 
               <Button variant="gold" className="w-full" onClick={handleM3UUrl} disabled={loading}>
-                {loading ? "Loading playlist…" : "Load Playlist"}
+                {loading ? "Fetching playlist…" : "Load Playlist"}
               </Button>
             </div>
           )}
@@ -311,8 +350,8 @@ export const LoaderPanel = ({ onLoad }: Props) => {
           <Shield className="h-3.5 w-3.5 text-primary" />
           <span>
             {mode === "file"
-              ? "100% Client-side. Your playlist never leaves your device."
-              : "IPTV credentials sent securely to provider. App login never used for playlists."}
+              ? "100% client-side. Your playlist never leaves your device."
+              : "IPTV credentials sent securely to provider only. Your Team 8K login is never used for playlists."}
           </span>
         </div>
       </div>
