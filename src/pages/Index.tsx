@@ -202,8 +202,6 @@ const Index = () => {
   // ── Google Drive upload ───────────────────────────────────────
   const getAccessToken = (): Promise<string> =>
     new Promise(async (resolve, reject) => {
-      await Promise.all([loadGapiScript(), loadGisScript()]);
-
       if (driveAccessToken) { resolve(driveAccessToken); return; }
 
       if (!GDRIVE_CLIENT_ID) {
@@ -211,16 +209,36 @@ const Index = () => {
         return;
       }
 
-      const client = window.google.accounts.oauth2.initTokenClient({
-        client_id: GDRIVE_CLIENT_ID,
-        scope: GDRIVE_SCOPE,
-        callback: (resp: any) => {
-          if (resp.error) { reject(new Error(resp.error)); return; }
-          setDriveAccessToken(resp.access_token);
-          resolve(resp.access_token);
-        },
+      // Load GIS script first
+      await loadGisScript();
+
+      // Wait until window.google.accounts.oauth2 is ready
+      await new Promise<void>((res) => {
+        const check = () => {
+          if (window.google?.accounts?.oauth2) { res(); return; }
+          setTimeout(check, 100);
+        };
+        check();
       });
-      client.requestAccessToken();
+
+      try {
+        const client = window.google.accounts.oauth2.initTokenClient({
+          client_id: GDRIVE_CLIENT_ID,
+          scope: GDRIVE_SCOPE,
+          callback: (resp: any) => {
+            if (resp.error) { reject(new Error(`OAuth error: ${resp.error}`)); return; }
+            if (!resp.access_token) { reject(new Error("No access token received from Google")); return; }
+            setDriveAccessToken(resp.access_token);
+            resolve(resp.access_token);
+          },
+          error_callback: (err: any) => {
+            reject(new Error(`OAuth failed: ${JSON.stringify(err)}`));
+          },
+        });
+        client.requestAccessToken({ prompt: "" });
+      } catch (e: any) {
+        reject(new Error(`Failed to init OAuth client: ${e.message}`));
+      }
     });
 
   const handleSaveToDrive = async () => {
@@ -233,10 +251,11 @@ const Index = () => {
       setDriveFileId(fileId);
 
       // Direct download URL that IPTV players can use
+      // This works if file is public, otherwise user needs to share manually
       const url = `https://drive.google.com/uc?export=download&id=${fileId}`;
       setDriveUrl(url);
       await navigator.clipboard.writeText(url);
-      toast.success(`Saved to Google Drive — ${enabledCount} channels. URL copied!`);
+      toast.success(`Saved to Google Drive — ${enabledCount} channels. URL copied! Share the file publicly in Google Drive for your player to access it.`);
     } catch (err: any) {
       toast.error(err.message || "Google Drive upload failed");
     } finally {
