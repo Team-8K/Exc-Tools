@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Search, Trash2, Download, Copy, RotateCcw, Tv, ToggleLeft, Link, CloudUpload, Check, ExternalLink } from "lucide-react";
+import { Search, Trash2, Download, Copy, RotateCcw, Tv, ToggleLeft, CloudUpload, Check, ExternalLink } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -22,42 +22,31 @@ import {
   groupByCategory,
 } from "@/lib/m3u";
 
-// ── Google Drive helpers ────────────────────────────────────────
+// ── Google Drive OAuth (redirect-based, no popup) ───────────────
 const GDRIVE_CLIENT_ID = import.meta.env.VITE_GDRIVE_CLIENT_ID || "";
 const GDRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+const REDIRECT_URI = window.location.origin;
 
-declare global {
-  interface Window {
-    google?: any;
-    gapi?: any;
-  }
-}
-
-const loadGapiScript = (): Promise<void> =>
-  new Promise((resolve) => {
-    if (document.getElementById("gapi-script")) { resolve(); return; }
-    const s = document.createElement("script");
-    s.id = "gapi-script";
-    s.src = "https://apis.google.com/js/api.js";
-    s.onload = () => resolve();
-    document.head.appendChild(s);
+const buildAuthUrl = () => {
+  const params = new URLSearchParams({
+    client_id: GDRIVE_CLIENT_ID,
+    redirect_uri: REDIRECT_URI,
+    response_type: "token",
+    scope: GDRIVE_SCOPE,
+    include_granted_scopes: "true",
   });
+  return `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
+};
 
-const loadGisScript = (): Promise<void> =>
-  new Promise((resolve) => {
-    if (document.getElementById("gis-script")) { resolve(); return; }
-    const s = document.createElement("script");
-    s.id = "gis-script";
-    s.src = "https://accounts.google.com/gsi/client";
-    s.onload = () => resolve();
-    document.head.appendChild(s);
-  });
-
-// Upload or update a file in Google Drive, return the file ID
-const uploadToDrive = async (accessToken: string, m3uContent: string, existingFileId?: string): Promise<string> => {
+const uploadToDrive = async (
+  accessToken: string,
+  m3uContent: string,
+  existingFileId?: string
+): Promise<string> => {
   const fileName = "team8k-playlist.m3u";
   const mimeType = "audio/x-mpegurl";
-  const boundary = "team8k_boundary";
+  const boundary = "team8k_boundary_xyz";
+
   const body =
     `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n` +
     JSON.stringify({ name: fileName, mimeType }) +
@@ -79,18 +68,29 @@ const uploadToDrive = async (accessToken: string, m3uContent: string, existingFi
     body,
   });
 
-  if (!res.ok) throw new Error(`Drive upload failed: ${res.status}`);
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Upload failed (${res.status}): ${errText.slice(0, 200)}`);
+  }
+
   const data = await res.json();
 
-  // Make file publicly readable so the player can fetch it
-  await fetch(`https://www.googleapis.com/drive/v3/files/${data.id}/permissions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ role: "reader", type: "anyone" }),
-  });
+  // Set file as publicly readable
+  const permRes = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${data.id}/permissions`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ role: "reader", type: "anyone" }),
+    }
+  );
+
+  if (!permRes.ok) {
+    console.warn("Could not set public permission:", permRes.status);
+  }
 
   return data.id;
 };
@@ -104,20 +104,50 @@ const Index = () => {
   const [duplicatesRemoved, setDuplicatesRemoved] = useState(0);
 
   // Google Drive state
-  const [driveFileId, setDriveFileId] = useState<string>("");
-  const [driveUrl, setDriveUrl] = useState<string>("");
+  const [driveFileId, setDriveFileId] = useState<string>(() =>
+    localStorage.getItem("team8k_drive_file_id") || ""
+  );
+  const [driveUrl, setDriveUrl] = useState<string>(() =>
+    localStorage.getItem("team8k_drive_url") || ""
+  );
   const [driveUploading, setDriveUploading] = useState(false);
-  const [driveAccessToken, setDriveAccessToken] = useState<string>("");
 
+  // On mount: check for OAuth token in URL hash (after redirect back from Google)
   useEffect(() => {
     const hash = window.location.hash;
-    const match = hash.match(/[#&]playlist=([^&]*)/);
-    if (match) {
-      try {
-        const decoded = decodeURIComponent(escape(atob(match[1])));
-        handleLoad(decoded, "Shared Playlist Link");
+
+    // Check for OAuth access_token returned by Google redirect
+    if (hash.includes("access_token=")) {
+      const params = new URLSearchParams(hash.replace("#", ""));
+      const token = params.get("access_token");
+      if (token) {
+        // Store token temporarily
+        sessionStorage.setItem("team8k_gdrive_token", token);
+
+        // Restore M3U content saved before redirect
+        const savedM3U = localStorage.getItem("team8k_pending_m3u");
+        const savedSource = localStorage.getItem("team8k_pending_source");
+        const savedChannels = localStorage.getItem("team8k_pending_channels");
+
+        if (savedM3U && savedChannels) {
+          try {
+            const parsed = JSON.parse(savedChannels) as Channel[];
+            setChannels(parsed);
+            setSource(savedSource || "Restored playlist");
+            localStorage.removeItem("team8k_pending_m3u");
+            localStorage.removeItem("team8k_pending_source");
+            localStorage.removeItem("team8k_pending_channels");
+
+            // Auto-upload now that we have the token
+            setTimeout(() => doUpload(token, parsed), 500);
+          } catch {
+            toast.error("Could not restore playlist after Google auth");
+          }
+        }
+
+        // Clean URL
         window.history.replaceState(null, "", window.location.pathname);
-      } catch { /* ignore */ }
+      }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -130,8 +160,6 @@ const Index = () => {
     setSearch("");
     setCategoryFilter("all");
     setDuplicatesRemoved(0);
-    setDriveFileId("");
-    setDriveUrl("");
   };
 
   const categories = useMemo(
@@ -171,11 +199,9 @@ const Index = () => {
   const handleReset = () => {
     setChannels([]); setSource(""); setSearch("");
     setCategoryFilter("all"); setDuplicatesRemoved(0);
-    setDriveFileId(""); setDriveUrl("");
   };
 
-  // Export only enabled channels
-  const getEnabledM3U = () => exportM3U(channels); // exportM3U already skips disabled
+  const getEnabledM3U = (chans: Channel[] = channels) => exportM3U(chans);
 
   const handleDownload = () => {
     const text = getEnabledM3U();
@@ -200,67 +226,50 @@ const Index = () => {
   };
 
   // ── Google Drive upload ───────────────────────────────────────
-  const getAccessToken = (): Promise<string> =>
-    new Promise(async (resolve, reject) => {
-      if (driveAccessToken) { resolve(driveAccessToken); return; }
-
-      if (!GDRIVE_CLIENT_ID) {
-        reject(new Error("Google Drive not configured. Add VITE_GDRIVE_CLIENT_ID to your environment variables."));
-        return;
-      }
-
-      // Load GIS script first
-      await loadGisScript();
-
-      // Wait until window.google.accounts.oauth2 is ready
-      await new Promise<void>((res) => {
-        const check = () => {
-          if (window.google?.accounts?.oauth2) { res(); return; }
-          setTimeout(check, 100);
-        };
-        check();
-      });
-
-      try {
-        const client = window.google.accounts.oauth2.initTokenClient({
-          client_id: GDRIVE_CLIENT_ID,
-          scope: GDRIVE_SCOPE,
-          callback: (resp: any) => {
-            if (resp.error) { reject(new Error(`OAuth error: ${resp.error}`)); return; }
-            if (!resp.access_token) { reject(new Error("No access token received from Google")); return; }
-            setDriveAccessToken(resp.access_token);
-            resolve(resp.access_token);
-          },
-          error_callback: (err: any) => {
-            reject(new Error(`OAuth failed: ${JSON.stringify(err)}`));
-          },
-        });
-        client.requestAccessToken({ prompt: "" });
-      } catch (e: any) {
-        reject(new Error(`Failed to init OAuth client: ${e.message}`));
-      }
-    });
-
-  const handleSaveToDrive = async () => {
-    if (enabledCount === 0) { toast.error("No enabled channels to save"); return; }
+  const doUpload = async (token: string, chans: Channel[] = channels) => {
     setDriveUploading(true);
     try {
-      const token = await getAccessToken();
-      const m3uContent = getEnabledM3U();
-      const fileId = await uploadToDrive(token, m3uContent, driveFileId || undefined);
-      setDriveFileId(fileId);
+      const m3uContent = getEnabledM3U(chans);
+      const existingId = localStorage.getItem("team8k_drive_file_id") || driveFileId || undefined;
+      const fileId = await uploadToDrive(token, m3uContent, existingId);
 
-      // Direct download URL that IPTV players can use
-      // This works if file is public, otherwise user needs to share manually
       const url = `https://drive.google.com/uc?export=download&id=${fileId}`;
+
+      setDriveFileId(fileId);
       setDriveUrl(url);
-      await navigator.clipboard.writeText(url);
-      toast.success(`Saved to Google Drive — ${enabledCount} channels. URL copied! Share the file publicly in Google Drive for your player to access it.`);
+      localStorage.setItem("team8k_drive_file_id", fileId);
+      localStorage.setItem("team8k_drive_url", url);
+
+      await navigator.clipboard.writeText(url).catch(() => {});
+      toast.success(`Saved to Google Drive — ${enabledCount} channels. URL copied!`);
     } catch (err: any) {
       toast.error(err.message || "Google Drive upload failed");
     } finally {
       setDriveUploading(false);
     }
+  };
+
+  const handleSaveToDrive = async () => {
+    if (enabledCount === 0) { toast.error("No enabled channels to save"); return; }
+    if (!GDRIVE_CLIENT_ID) { toast.error("Google Drive not configured"); return; }
+
+    // Check for existing token in session
+    const existingToken = sessionStorage.getItem("team8k_gdrive_token");
+    if (existingToken) {
+      await doUpload(existingToken);
+      return;
+    }
+
+    // No token — save state and redirect to Google OAuth
+    const m3uContent = getEnabledM3U();
+    localStorage.setItem("team8k_pending_m3u", m3uContent);
+    localStorage.setItem("team8k_pending_source", source);
+    localStorage.setItem("team8k_pending_channels", JSON.stringify(channels));
+
+    toast("Redirecting to Google to authorise...");
+    setTimeout(() => {
+      window.location.href = buildAuthUrl();
+    }, 800);
   };
 
   const handleCopyDriveUrl = async () => {
@@ -366,7 +375,7 @@ const Index = () => {
                   </Select>
                 </div>
 
-                {/* Groups */}
+                {/* Channel groups */}
                 <div className="space-y-4">
                   {groupKeys.length === 0 ? (
                     <div className="bg-gradient-card ring-gold rounded-2xl p-12 text-center text-muted-foreground">
@@ -394,7 +403,10 @@ const Index = () => {
                       <Check className="h-4 w-4 text-green-500" />
                       <p className="text-sm font-display font-bold text-green-500">Saved to Google Drive</p>
                     </div>
-                    <p className="text-xs text-muted-foreground">Paste this URL into Tivimate, Smarters, or any IPTV player as your M3U source. It will always serve your latest edited playlist.</p>
+                    <p className="text-xs text-muted-foreground">
+                      Paste this URL into Tivimate, Smarters, or any IPTV player as your M3U source.
+                      Every time you edit and click "Save to Drive", this same URL updates automatically.
+                    </p>
                     <div className="flex gap-2 items-center">
                       <code className="flex-1 text-xs bg-background/60 border border-border rounded-lg px-3 py-2 truncate text-primary">
                         {driveUrl}
@@ -406,7 +418,6 @@ const Index = () => {
                         <ExternalLink className="h-3.5 w-3.5" />
                       </Button>
                     </div>
-                    <p className="text-xs text-muted-foreground">Next time you edit and click "Save to Drive", the same URL will update automatically — no need to re-paste in your player.</p>
                   </div>
                 )}
 
