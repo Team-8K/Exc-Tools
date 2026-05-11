@@ -1,167 +1,90 @@
-import { useEffect, useMemo, useState } from "react";
-import { Search, Trash2, Download, Copy, RotateCcw, Tv, ToggleLeft, CloudUpload, Check, ExternalLink } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
+  Search, Trash2, Download, Copy, RotateCcw, Tv, ToggleLeft,
+  CloudUpload, Check, ExternalLink, History, PlusCircle, X
+} from "lucide-react";
+import { Button }   from "@/components/ui/button";
+import { Input }    from "@/components/ui/input";
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { toast } from "sonner";
-import { LoaderPanel } from "@/components/LoaderPanel";
-import { CategoryGroup } from "@/components/CategoryGroup";
+import { LoaderPanel }    from "@/components/LoaderPanel";
+import { CategoryGroup }  from "@/components/CategoryGroup";
 import { SummarySidebar } from "@/components/SummarySidebar";
 import {
-  Channel,
-  parseM3U,
-  exportM3U,
-  dedupeByUrl,
-  groupByCategory,
+  Channel, parseM3U, exportM3U, dedupeByUrl, groupByCategory,
 } from "@/lib/m3u";
+import { useGoogleDrive } from "@/hooks/useGoogleDrive";
+import { useSession }     from "@/hooks/useSession";
 
-// ── Google Drive OAuth (redirect-based, no popup) ───────────────
-const GDRIVE_CLIENT_ID = import.meta.env.VITE_GDRIVE_CLIENT_ID || "";
-const GDRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
-const REDIRECT_URI = window.location.origin;
-
-const buildAuthUrl = () => {
-  const params = new URLSearchParams({
-    client_id: GDRIVE_CLIENT_ID,
-    redirect_uri: REDIRECT_URI,
-    response_type: "token",
-    scope: GDRIVE_SCOPE,
-    include_granted_scopes: "true",
-  });
-  return `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
-};
-
-const uploadToDrive = async (
-  accessToken: string,
-  m3uContent: string,
-  existingFileId?: string
-): Promise<string> => {
-  const fileName = "team8k-playlist.m3u";
-  const mimeType = "audio/x-mpegurl";
-  const boundary = "team8k_boundary_xyz";
-
-  const body =
-    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n` +
-    JSON.stringify({ name: fileName, mimeType }) +
-    `\r\n--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n` +
-    m3uContent +
-    `\r\n--${boundary}--`;
-
-  const method = existingFileId ? "PATCH" : "POST";
-  const endpoint = existingFileId
-    ? `https://www.googleapis.com/upload/drive/v3/files/${existingFileId}?uploadType=multipart`
-    : "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart";
-
-  const res = await fetch(endpoint, {
-    method,
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": `multipart/related; boundary=${boundary}`,
-    },
-    body,
-  });
-
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Upload failed (${res.status}): ${errText.slice(0, 200)}`);
-  }
-
-  const data = await res.json();
-
-  // Set file as publicly readable
-  const permRes = await fetch(
-    `https://www.googleapis.com/drive/v3/files/${data.id}/permissions`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ role: "reader", type: "anyone" }),
-    }
-  );
-
-  if (!permRes.ok) {
-    console.warn("Could not set public permission:", permRes.status);
-  }
-
-  return data.id;
-};
-
-// ── Component ───────────────────────────────────────────────────
 const Index = () => {
-  const [channels, setChannels] = useState<Channel[]>([]);
-  const [source, setSource] = useState<string>("");
-  const [search, setSearch] = useState("");
-  const [categoryFilter, setCategoryFilter] = useState<string>("all");
+  // ── Core state ────────────────────────────────────────────────
+  const [channels,       setChannels]       = useState<Channel[]>([]);
+  const [sourceChannels, setSourceChannels] = useState<Channel[]>([]); // full original
+  const [source,         setSource]         = useState("");
+  const [search,         setSearch]         = useState("");
+  const [categoryFilter, setCategoryFilter] = useState("all");
   const [duplicatesRemoved, setDuplicatesRemoved] = useState(0);
 
-  // Google Drive state
-  const [driveFileId, setDriveFileId] = useState<string>(() =>
-    localStorage.getItem("team8k_drive_file_id") || ""
-  );
-  const [driveUrl, setDriveUrl] = useState<string>(() =>
-    localStorage.getItem("team8k_drive_url") || ""
-  );
-  const [driveUploading, setDriveUploading] = useState(false);
+  // Add-channels modal
+  const [addModalOpen,  setAddModalOpen]  = useState(false);
+  const [addSearch,     setAddSearch]     = useState("");
+  const [addSelected,   setAddSelected]   = useState<Set<string>>(new Set());
 
-  // On mount: check for OAuth token in URL hash (after redirect back from Google)
+  const { saveToDrive, uploading, driveUrl, isConnected } = useGoogleDrive();
+  const { saveSession, loadSession, clearSession, hasSession } = useSession();
+
+  // ── Handle OAuth redirect after Google auth ───────────────────
   useEffect(() => {
-    const hash = window.location.hash;
-
-    // Check for OAuth access_token returned by Google redirect
-    if (hash.includes("access_token=")) {
-      const params = new URLSearchParams(hash.replace("#", ""));
-      const token = params.get("access_token");
-      if (token) {
-        // Store token temporarily
-        sessionStorage.setItem("team8k_gdrive_token", token);
-
-        // Restore M3U content saved before redirect
-        const savedM3U = localStorage.getItem("team8k_pending_m3u");
-        const savedSource = localStorage.getItem("team8k_pending_source");
-        const savedChannels = localStorage.getItem("team8k_pending_channels");
-
-        if (savedM3U && savedChannels) {
-          try {
-            const parsed = JSON.parse(savedChannels) as Channel[];
-            setChannels(parsed);
-            setSource(savedSource || "Restored playlist");
-            localStorage.removeItem("team8k_pending_m3u");
-            localStorage.removeItem("team8k_pending_source");
-            localStorage.removeItem("team8k_pending_channels");
-
-            // Auto-upload now that we have the token
-            setTimeout(() => doUpload(token, parsed), 500);
-          } catch {
-            toast.error("Could not restore playlist after Google auth");
-          }
-        }
-
-        // Clean URL
-        window.history.replaceState(null, "", window.location.pathname);
+    const onReady = (e: Event) => {
+      const { token, pendingContent } = (e as CustomEvent).detail;
+      if (pendingContent) {
+        doSaveToDrive(token, pendingContent);
       }
-    }
+    };
+    window.addEventListener("gdrive-ready", onReady);
+    return () => window.removeEventListener("gdrive-ready", onReady);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // ── Load playlist ─────────────────────────────────────────────
   const handleLoad = (content: string, src: string) => {
     const parsed = parseM3U(content);
     if (!parsed.length) { toast.error("No channels found in playlist"); return; }
     setChannels(parsed);
+    setSourceChannels(parsed); // save original source
     setSource(src);
     setSearch("");
     setCategoryFilter("all");
     setDuplicatesRemoved(0);
+    // Auto-save session
+    saveSession(parsed, parsed, src);
+    toast.success(`Loaded ${parsed.length.toLocaleString()} channels`);
   };
 
+  // ── Restore saved session ────────────────────────────────────
+  const handleRestoreSession = () => {
+    const session = loadSession();
+    if (!session) return;
+    setChannels(session.channels);
+    setSourceChannels(session.sourceChannels);
+    setSource(session.source);
+    setSearch("");
+    setCategoryFilter("all");
+    setDuplicatesRemoved(0);
+    toast.success("Session restored — continue where you left off");
+  };
+
+  // ── Auto-save session on channel changes ─────────────────────
+  const isFirstRender = useRef(true);
+  useEffect(() => {
+    if (isFirstRender.current) { isFirstRender.current = false; return; }
+    if (channels.length > 0) saveSession(channels, sourceChannels, source);
+  }, [channels, source, sourceChannels, saveSession]);
+
+  // ── Derived values ────────────────────────────────────────────
   const categories = useMemo(
     () => Array.from(new Set(channels.map((c) => c.category))).sort(),
     [channels]
@@ -176,108 +99,102 @@ const Index = () => {
     });
   }, [channels, search, categoryFilter]);
 
-  const grouped = useMemo(() => groupByCategory(filtered), [filtered]);
+  const grouped   = useMemo(() => groupByCategory(filtered), [filtered]);
   const groupKeys = useMemo(() => Object.keys(grouped).sort(), [grouped]);
   const enabledCount = channels.filter((c) => c.enabled).length;
 
+  // ── Channel actions ───────────────────────────────────────────
   const updateChannel = (id: string, patch: Partial<Channel>) =>
     setChannels((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
 
   const handleDedupe = () => {
     const { channels: cleaned, removed } = dedupeByUrl(channels);
     setChannels(cleaned);
-    setDuplicatesRemoved((prev) => prev + removed);
+    setDuplicatesRemoved((p) => p + removed);
     toast.success(removed > 0 ? `Removed ${removed} duplicate${removed > 1 ? "s" : ""}` : "No duplicates found");
   };
 
   const handleEnableAll = (enabled: boolean) =>
     setChannels((prev) => prev.map((c) => ({ ...c, enabled })));
 
-  const handleToggleCategoryAll = (category: string, enabled: boolean) =>
-    setChannels((prev) => prev.map((c) => (c.category === category ? { ...c, enabled } : c)));
+  const handleToggleCategoryAll = (cat: string, enabled: boolean) =>
+    setChannels((prev) => prev.map((c) => (c.category === cat ? { ...c, enabled } : c)));
 
   const handleReset = () => {
-    setChannels([]); setSource(""); setSearch("");
-    setCategoryFilter("all"); setDuplicatesRemoved(0);
+    setChannels([]); setSourceChannels([]); setSource("");
+    setSearch(""); setCategoryFilter("all"); setDuplicatesRemoved(0);
+    clearSession();
   };
 
-  const getEnabledM3U = (chans: Channel[] = channels) => exportM3U(chans);
+  // ── Add channels from source ──────────────────────────────────
+  const sourceNotInPlaylist = useMemo(() => {
+    const currentUrls = new Set(channels.map((c) => c.url));
+    return sourceChannels.filter((c) => !currentUrls.has(c.url));
+  }, [channels, sourceChannels]);
+
+  const addFiltered = useMemo(() => {
+    const q = addSearch.trim().toLowerCase();
+    if (!q) return sourceNotInPlaylist;
+    return sourceNotInPlaylist.filter(
+      (c) => c.name.toLowerCase().includes(q) || c.category.toLowerCase().includes(q)
+    );
+  }, [sourceNotInPlaylist, addSearch]);
+
+  const addGrouped  = useMemo(() => groupByCategory(addFiltered), [addFiltered]);
+  const addGroupKeys = useMemo(() => Object.keys(addGrouped).sort(), [addGrouped]);
+
+  const handleConfirmAdd = () => {
+    if (addSelected.size === 0) return;
+    const toAdd = sourceChannels.filter((c) => addSelected.has(c.id));
+    setChannels((prev) => [...prev, ...toAdd]);
+    setAddSelected(new Set());
+    setAddModalOpen(false);
+    toast.success(`Added ${toAdd.length} channel${toAdd.length > 1 ? "s" : ""}`);
+  };
+
+  // ── Export ────────────────────────────────────────────────────
+  const getM3U = () => exportM3U(channels.filter((c) => c.enabled));
 
   const handleDownload = () => {
-    const text = getEnabledM3U();
-    const blob = new Blob([text], { type: "audio/x-mpegurl" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "team8k-playlist.m3u";
-    a.click();
+    const blob = new Blob([getM3U()], { type: "audio/x-mpegurl" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href = url; a.download = "team8k-playlist.m3u"; a.click();
     URL.revokeObjectURL(url);
-    toast.success(`Downloaded — ${enabledCount} enabled channels`);
+    toast.success(`Downloaded — ${enabledCount} channels`);
   };
 
   const handleCopy = async () => {
-    const text = getEnabledM3U();
     try {
-      await navigator.clipboard.writeText(text);
-      toast.success(`Copied — ${enabledCount} enabled channels`);
-    } catch {
-      toast.error("Clipboard unavailable");
-    }
+      await navigator.clipboard.writeText(getM3U());
+      toast.success(`Copied — ${enabledCount} channels`);
+    } catch { toast.error("Clipboard unavailable"); }
   };
 
-  // ── Google Drive upload ───────────────────────────────────────
-  const doUpload = async (token: string, chans: Channel[] = channels) => {
-    setDriveUploading(true);
+  // ── Google Drive ──────────────────────────────────────────────
+  const doSaveToDrive = async (token?: string, content?: string) => {
+    const m3u = content || getM3U();
+    if (!m3u.includes("#EXTINF")) { toast.error("No enabled channels to save"); return; }
     try {
-      const m3uContent = getEnabledM3U(chans);
-      const existingId = localStorage.getItem("team8k_drive_file_id") || driveFileId || undefined;
-      const fileId = await uploadToDrive(token, m3uContent, existingId);
-
-      const url = `https://drive.google.com/uc?export=download&id=${fileId}`;
-
-      setDriveFileId(fileId);
-      setDriveUrl(url);
-      localStorage.setItem("team8k_drive_file_id", fileId);
-      localStorage.setItem("team8k_drive_url", url);
-
-      await navigator.clipboard.writeText(url).catch(() => {});
-      toast.success(`Saved to Google Drive — ${enabledCount} channels. URL copied!`);
-    } catch (err: any) {
-      toast.error(err.message || "Google Drive upload failed");
-    } finally {
-      setDriveUploading(false);
+      const url = token
+        ? await saveToDrive(m3u)   // called after auth redirect
+        : await saveToDrive(m3u);  // normal call
+      if (url) {
+        await navigator.clipboard.writeText(url).catch(() => {});
+        toast.success("Saved to Google Drive — URL copied!");
+      }
+    } catch (err: unknown) {
+      toast.error(err instanceof Error ? err.message : "Drive upload failed");
     }
-  };
-
-  const handleSaveToDrive = async () => {
-    if (enabledCount === 0) { toast.error("No enabled channels to save"); return; }
-    if (!GDRIVE_CLIENT_ID) { toast.error("Google Drive not configured"); return; }
-
-    // Check for existing token in session
-    const existingToken = sessionStorage.getItem("team8k_gdrive_token");
-    if (existingToken) {
-      await doUpload(existingToken);
-      return;
-    }
-
-    // No token — save state and redirect to Google OAuth
-    const m3uContent = getEnabledM3U();
-    localStorage.setItem("team8k_pending_m3u", m3uContent);
-    localStorage.setItem("team8k_pending_source", source);
-    localStorage.setItem("team8k_pending_channels", JSON.stringify(channels));
-
-    toast("Redirecting to Google to authorise...");
-    setTimeout(() => {
-      window.location.href = buildAuthUrl();
-    }, 800);
   };
 
   const handleCopyDriveUrl = async () => {
     if (!driveUrl) return;
     await navigator.clipboard.writeText(driveUrl);
-    toast.success("M3U URL copied to clipboard");
+    toast.success("URL copied");
   };
 
+  // ── Render ────────────────────────────────────────────────────
   return (
     <SidebarProvider style={{ minHeight: "unset" }}>
       <div className="flex w-full pb-16 relative overflow-x-hidden" style={{ minHeight: "unset" }}>
@@ -296,6 +213,7 @@ const Index = () => {
               <span className="ml-3 text-xs tracking-[0.25em] uppercase text-muted-foreground font-display">Summary</span>
             </div>
           )}
+
           <div className="container max-w-6xl">
             <div className="editor-page-title">
               <h1 className="text-3xl">Premium M3U Playlist Editor &amp; Cleaner</h1>
@@ -304,16 +222,36 @@ const Index = () => {
             {channels.length === 0 ? (
               <main className="animate-fade-in">
                 <div className="text-center mb-10">
-                  <h2 className="font-display font-bold text-3xl mb-3 md:text-4xl text-center">Load Your Playlist</h2>
+                  <h2 className="font-display font-bold text-3xl mb-3 md:text-4xl">Load Your Playlist</h2>
                   <p className="text-muted-foreground text-sm">Everything runs in your browser — nothing is stored or uploaded.</p>
                 </div>
+
+                {/* Continue editing banner */}
+                {hasSession() && (
+                  <div className="max-w-2xl mx-auto mb-6">
+                    <div className="bg-primary/10 border border-primary/30 rounded-2xl p-5 flex items-center justify-between gap-4">
+                      <div className="flex items-center gap-3">
+                        <History className="h-5 w-5 text-primary shrink-0" />
+                        <div>
+                          <p className="font-display font-bold text-sm text-primary">Saved session found</p>
+                          <p className="text-xs text-muted-foreground">Continue editing your last playlist without re-uploading.</p>
+                        </div>
+                      </div>
+                      <Button variant="gold" size="sm" onClick={handleRestoreSession}>
+                        Continue editing
+                      </Button>
+                    </div>
+                  </div>
+                )}
+
                 <LoaderPanel onLoad={handleLoad} />
+
                 <div className="mt-10 max-w-3xl mx-auto grid grid-cols-2 md:grid-cols-4 gap-3">
                   {[
-                    { t: "Edit & Rename", d: "Rename any channel" },
-                    { t: "Smart Dedupe", d: "Strip duplicate URLs" },
+                    { t: "Edit & Rename",  d: "Rename any channel" },
+                    { t: "Smart Dedupe",   d: "Strip duplicate URLs" },
                     { t: "Group & Filter", d: "Auto-group by category" },
-                    { t: "Clean Export", d: "Valid M3U output" },
+                    { t: "Clean Export",   d: "Valid M3U output" },
                   ].map((f) => (
                     <div key={f.t} className="bg-gradient-card ring-gold rounded-xl p-5 text-center">
                       <h4 className="font-display font-bold text-sm mb-1">{f.t}</h4>
@@ -324,6 +262,7 @@ const Index = () => {
               </main>
             ) : (
               <main className="animate-fade-in space-y-6">
+
                 {/* Stats bar */}
                 <div className="bg-gradient-card ring-gold rounded-2xl p-5 md:p-6 shadow-elegant flex flex-wrap items-center gap-4 justify-between">
                   <div className="flex items-center gap-5">
@@ -347,6 +286,11 @@ const Index = () => {
                     <Button variant="goldOutline" size="sm" onClick={handleDedupe}>
                       <Trash2 className="h-4 w-4" /> Dedupe
                     </Button>
+                    {sourceNotInPlaylist.length > 0 && (
+                      <Button variant="goldOutline" size="sm" onClick={() => setAddModalOpen(true)}>
+                        <PlusCircle className="h-4 w-4" /> Add Channels
+                      </Button>
+                    )}
                     <Button variant="goldOutline" size="sm" onClick={handleReset}>
                       <RotateCcw className="h-4 w-4" /> Reset
                     </Button>
@@ -389,14 +333,14 @@ const Index = () => {
                         channels={grouped[cat]}
                         defaultOpen={groupKeys.length <= 3 || !!search}
                         onToggle={(id, enabled) => updateChannel(id, { enabled })}
-                        onRename={(id, name) => updateChannel(id, { name })}
+                        onRename={(id, name)    => updateChannel(id, { name })}
                         onToggleAll={handleToggleCategoryAll}
                       />
                     ))
                   )}
                 </div>
 
-                {/* Google Drive URL display */}
+                {/* Drive URL display */}
                 {driveUrl && (
                   <div className="bg-gradient-card ring-gold rounded-2xl p-4 md:p-5 space-y-3">
                     <div className="flex items-center gap-2">
@@ -404,8 +348,8 @@ const Index = () => {
                       <p className="text-sm font-display font-bold text-green-500">Saved to Google Drive</p>
                     </div>
                     <p className="text-xs text-muted-foreground">
-                      Paste this URL into Tivimate, Smarters, or any IPTV player as your M3U source.
-                      Every time you edit and click "Save to Drive", this same URL updates automatically.
+                      Paste this URL into TiviMate, Smarters, or any IPTV player.
+                      Every time you click "Update Drive", this same URL updates automatically.
                     </p>
                     <div className="flex gap-2 items-center">
                       <code className="flex-1 text-xs bg-background/60 border border-border rounded-lg px-3 py-2 truncate text-primary">
@@ -421,7 +365,7 @@ const Index = () => {
                   </div>
                 )}
 
-                {/* Export bar */}
+                {/* Export bar — sticky */}
                 <div className="sticky bottom-0 z-30">
                   <div className="bg-gradient-card ring-gold rounded-2xl p-4 md:p-5 shadow-gold backdrop-blur-md flex flex-wrap gap-3 justify-between items-center">
                     <p className="text-sm">
@@ -433,13 +377,9 @@ const Index = () => {
                       <Button variant="goldOutline" onClick={handleCopy}>
                         <Copy className="h-4 w-4" /> Copy
                       </Button>
-                      <Button
-                        variant="goldOutline"
-                        onClick={handleSaveToDrive}
-                        disabled={driveUploading}
-                      >
+                      <Button variant="goldOutline" onClick={() => doSaveToDrive()} disabled={uploading}>
                         <CloudUpload className="h-4 w-4" />
-                        {driveUploading ? "Saving…" : driveFileId ? "Update Drive" : "Save to Drive"}
+                        {uploading ? "Saving…" : isConnected && driveUrl ? "Update Drive" : "Save to Drive"}
                       </Button>
                       <Button variant="gold" onClick={handleDownload}>
                         <Download className="h-4 w-4" /> Download M3U
@@ -452,6 +392,94 @@ const Index = () => {
           </div>
         </div>
       </div>
+
+      {/* Add Channels Modal */}
+      {addModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="bg-background border border-border rounded-2xl shadow-elegant w-full max-w-2xl max-h-[80vh] flex flex-col">
+            {/* Header */}
+            <div className="flex items-center justify-between p-5 border-b border-border">
+              <div>
+                <h2 className="font-display font-bold text-lg">Add Channels</h2>
+                <p className="text-xs text-muted-foreground">
+                  {sourceNotInPlaylist.length} channels available from your source
+                </p>
+              </div>
+              <button onClick={() => { setAddModalOpen(false); setAddSelected(new Set()); }} className="text-muted-foreground hover:text-foreground">
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            {/* Search */}
+            <div className="p-4 border-b border-border">
+              <div className="relative">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+                <Input
+                  placeholder="Search channels…"
+                  value={addSearch}
+                  onChange={(e) => setAddSearch(e.target.value)}
+                  className="pl-9 bg-background/60"
+                />
+              </div>
+            </div>
+
+            {/* Channel list */}
+            <div className="flex-1 overflow-y-auto p-4 space-y-3">
+              {addGroupKeys.length === 0 ? (
+                <p className="text-center text-muted-foreground text-sm py-8">No channels found.</p>
+              ) : (
+                addGroupKeys.map((cat) => (
+                  <div key={cat}>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground">{cat}</p>
+                      <button
+                        className="text-xs text-primary hover:underline"
+                        onClick={() => {
+                          const ids = new Set(addSelected);
+                          addGrouped[cat].forEach((c) => ids.add(c.id));
+                          setAddSelected(ids);
+                        }}
+                      >
+                        Select all
+                      </button>
+                    </div>
+                    {addGrouped[cat].map((ch) => (
+                      <label key={ch.id} className="flex items-center gap-3 py-1.5 px-2 rounded-lg hover:bg-muted/40 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={addSelected.has(ch.id)}
+                          onChange={(e) => {
+                            const ids = new Set(addSelected);
+                            e.target.checked ? ids.add(ch.id) : ids.delete(ch.id);
+                            setAddSelected(ids);
+                          }}
+                          className="accent-primary"
+                        />
+                        <span className="text-sm truncate flex-1">{ch.name}</span>
+                      </label>
+                    ))}
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* Footer */}
+            <div className="p-4 border-t border-border flex items-center justify-between">
+              <p className="text-sm text-muted-foreground">
+                {addSelected.size > 0 ? `${addSelected.size} selected` : "Nothing selected"}
+              </p>
+              <div className="flex gap-2">
+                <Button variant="goldOutline" onClick={() => { setAddModalOpen(false); setAddSelected(new Set()); }}>
+                  Cancel
+                </Button>
+                <Button variant="gold" onClick={handleConfirmAdd} disabled={addSelected.size === 0}>
+                  Add {addSelected.size > 0 ? `${addSelected.size} channel${addSelected.size > 1 ? "s" : ""}` : "Channels"}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </SidebarProvider>
   );
 };
