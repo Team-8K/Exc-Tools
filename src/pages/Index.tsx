@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { Search, Trash2, Download, Copy, RotateCcw, Tv, ToggleLeft, Link } from "lucide-react";
+import { useMemo, useState } from "react";
+import { Search, Trash2, Download, Copy, RotateCcw, Tv, ToggleLeft } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -28,23 +28,6 @@ const Index = () => {
   const [search, setSearch] = useState("");
   const [categoryFilter, setCategoryFilter] = useState<string>("all");
   const [duplicatesRemoved, setDuplicatesRemoved] = useState(0);
-
-  // Auto-load playlist from URL hash (e.g. shared link)
-  useEffect(() => {
-    const hash = window.location.hash;
-    const match = hash.match(/[#&]playlist=([^&]*)/);
-    if (match) {
-      try {
-        const decoded = decodeURIComponent(escape(atob(match[1])));
-        handleLoad(decoded, "Shared Playlist Link");
-        // Clean the hash from the URL without reloading
-        window.history.replaceState(null, "", window.location.pathname);
-      } catch {
-        // Invalid hash, ignore
-      }
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   const handleLoad = (content: string, src: string) => {
     const parsed = parseM3U(content);
@@ -128,20 +111,6 @@ const Index = () => {
       toast.success("Copied to clipboard");
     } catch {
       toast.error("Clipboard unavailable");
-    }
-  };
-
-  const handleGetUrl = async () => {
-    try {
-      const text = exportM3U(channels);
-      // Encode the playlist as base64 and put it in the URL hash
-      // We use encodeURIComponent so special chars are safe
-      const encoded = btoa(unescape(encodeURIComponent(text)));
-      const url = `${window.location.origin}${window.location.pathname}#playlist=${encoded}`;
-      await navigator.clipboard.writeText(url);
-      toast.success("Playlist URL copied! Anyone with this link can load your edited playlist.");
-    } catch {
-      toast.error("Could not generate URL");
     }
   };
 
@@ -292,12 +261,9 @@ const Index = () => {
                   </span>
                   <span className="text-muted-foreground"> channels</span>
                 </p>
-                <div className="flex gap-2 flex-wrap">
+                <div className="flex gap-2">
                   <Button variant="goldOutline" onClick={handleCopy}>
                     <Copy className="h-4 w-4" /> Copy
-                  </Button>
-                  <Button variant="goldOutline" onClick={handleGetUrl}>
-                    <Link className="h-4 w-4" /> Get URL
                   </Button>
                   <Button variant="gold" onClick={handleDownload}>
                     <Download className="h-4 w-4" /> Download M3U
