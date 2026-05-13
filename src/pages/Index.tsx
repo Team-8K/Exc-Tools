@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { Search, Trash2, Download, Copy, RotateCcw, Tv, ToggleLeft } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Search, Trash2, Download, Copy, RotateCcw, Tv, ToggleLeft, Link } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -28,6 +28,23 @@ const Index = () => {
   const [search, setSearch] = useState("");
   const [categoryFilter, setCategoryFilter] = useState<string>("all");
   const [duplicatesRemoved, setDuplicatesRemoved] = useState(0);
+
+  // Auto-load playlist from URL hash (e.g. shared link)
+  useEffect(() => {
+    const hash = window.location.hash;
+    const match = hash.match(/[#&]playlist=([^&]*)/);
+    if (match) {
+      try {
+        const decoded = decodeURIComponent(escape(atob(match[1])));
+        handleLoad(decoded, "Shared Playlist Link");
+        // Clean the hash from the URL without reloading
+        window.history.replaceState(null, "", window.location.pathname);
+      } catch {
+        // Invalid hash, ignore
+      }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleLoad = (content: string, src: string) => {
     const parsed = parseM3U(content);
@@ -111,6 +128,19 @@ const Index = () => {
       toast.success("Copied to clipboard");
     } catch {
       toast.error("Clipboard unavailable");
+    }
+  };
+
+  const handleGetUrl = async () => {
+    try {
+      const enabledOnly = channels.filter((c) => c.enabled);
+      const text = exportM3U(enabledOnly);
+      const encoded = btoa(unescape(encodeURIComponent(text)));
+      const url = `${window.location.origin}${window.location.pathname}#playlist=${encoded}`;
+      await navigator.clipboard.writeText(url);
+      toast.success(`URL copied — ${enabledOnly.length} enabled channels encoded.`);
+    } catch {
+      toast.error("Could not generate URL");
     }
   };
 
@@ -252,7 +282,7 @@ const Index = () => {
             </div>
 
             {/* Export bar (sticky) */}
-            <div className="sticky bottom-4 z-10">
+            <div className="sticky bottom-0 z-30">
               <div className="bg-gradient-card ring-gold rounded-2xl p-4 md:p-5 shadow-gold backdrop-blur-md flex flex-wrap gap-3 justify-between items-center">
                 <p className="text-sm">
                   <span className="text-muted-foreground">Ready to export </span>
@@ -261,9 +291,12 @@ const Index = () => {
                   </span>
                   <span className="text-muted-foreground"> channels</span>
                 </p>
-                <div className="flex gap-2">
+                <div className="flex gap-2 flex-wrap">
                   <Button variant="goldOutline" onClick={handleCopy}>
                     <Copy className="h-4 w-4" /> Copy
+                  </Button>
+                  <Button variant="goldOutline" onClick={handleGetUrl}>
+                    <Link className="h-4 w-4" /> Get URL
                   </Button>
                   <Button variant="gold" onClick={handleDownload}>
                     <Download className="h-4 w-4" /> Download M3U
