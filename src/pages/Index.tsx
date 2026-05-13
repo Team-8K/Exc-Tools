@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Search, Trash2, Download, Copy, RotateCcw, Tv, ToggleLeft, CloudUpload, Check, ExternalLink } from "lucide-react";
+import { Search, Trash2, Download, Copy, RotateCcw, Tv, ToggleLeft, Link } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -22,80 +22,6 @@ import {
   groupByCategory,
 } from "@/lib/m3u";
 
-// ── Google Drive OAuth (redirect-based, no popup) ───────────────
-const GDRIVE_CLIENT_ID = import.meta.env.VITE_GDRIVE_CLIENT_ID || "";
-const GDRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
-const REDIRECT_URI = window.location.origin;
-
-const buildAuthUrl = () => {
-  const params = new URLSearchParams({
-    client_id: GDRIVE_CLIENT_ID,
-    redirect_uri: REDIRECT_URI,
-    response_type: "token",
-    scope: GDRIVE_SCOPE,
-    include_granted_scopes: "true",
-  });
-  return `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
-};
-
-const uploadToDrive = async (
-  accessToken: string,
-  m3uContent: string,
-  existingFileId?: string
-): Promise<string> => {
-  const fileName = "team8k-playlist.m3u";
-  const mimeType = "audio/x-mpegurl";
-  const boundary = "team8k_boundary_xyz";
-
-  const body =
-    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n` +
-    JSON.stringify({ name: fileName, mimeType }) +
-    `\r\n--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n` +
-    m3uContent +
-    `\r\n--${boundary}--`;
-
-  const method = existingFileId ? "PATCH" : "POST";
-  const endpoint = existingFileId
-    ? `https://www.googleapis.com/upload/drive/v3/files/${existingFileId}?uploadType=multipart`
-    : "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart";
-
-  const res = await fetch(endpoint, {
-    method,
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": `multipart/related; boundary=${boundary}`,
-    },
-    body,
-  });
-
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Upload failed (${res.status}): ${errText.slice(0, 200)}`);
-  }
-
-  const data = await res.json();
-
-  // Set file as publicly readable
-  const permRes = await fetch(
-    `https://www.googleapis.com/drive/v3/files/${data.id}/permissions`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ role: "reader", type: "anyone" }),
-    }
-  );
-
-  if (!permRes.ok) {
-    console.warn("Could not set public permission:", permRes.status);
-  }
-
-  return data.id;
-};
-
-// ── Component ───────────────────────────────────────────────────
 const Index = () => {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [source, setSource] = useState<string>("");
@@ -103,50 +29,18 @@ const Index = () => {
   const [categoryFilter, setCategoryFilter] = useState<string>("all");
   const [duplicatesRemoved, setDuplicatesRemoved] = useState(0);
 
-  // Google Drive state
-  const [driveFileId, setDriveFileId] = useState<string>(() =>
-    localStorage.getItem("team8k_drive_file_id") || ""
-  );
-  const [driveUrl, setDriveUrl] = useState<string>(() =>
-    localStorage.getItem("team8k_drive_url") || ""
-  );
-  const [driveUploading, setDriveUploading] = useState(false);
-
-  // On mount: check for OAuth token in URL hash (after redirect back from Google)
+  // Auto-load playlist from URL hash (e.g. shared link)
   useEffect(() => {
     const hash = window.location.hash;
-
-    // Check for OAuth access_token returned by Google redirect
-    if (hash.includes("access_token=")) {
-      const params = new URLSearchParams(hash.replace("#", ""));
-      const token = params.get("access_token");
-      if (token) {
-        // Store token temporarily
-        sessionStorage.setItem("team8k_gdrive_token", token);
-
-        // Restore M3U content saved before redirect
-        const savedM3U = localStorage.getItem("team8k_pending_m3u");
-        const savedSource = localStorage.getItem("team8k_pending_source");
-        const savedChannels = localStorage.getItem("team8k_pending_channels");
-
-        if (savedM3U && savedChannels) {
-          try {
-            const parsed = JSON.parse(savedChannels) as Channel[];
-            setChannels(parsed);
-            setSource(savedSource || "Restored playlist");
-            localStorage.removeItem("team8k_pending_m3u");
-            localStorage.removeItem("team8k_pending_source");
-            localStorage.removeItem("team8k_pending_channels");
-
-            // Auto-upload now that we have the token
-            setTimeout(() => doUpload(token, parsed), 500);
-          } catch {
-            toast.error("Could not restore playlist after Google auth");
-          }
-        }
-
-        // Clean URL
+    const match = hash.match(/[#&]playlist=([^&]*)/);
+    if (match) {
+      try {
+        const decoded = decodeURIComponent(escape(atob(match[1])));
+        handleLoad(decoded, "Shared Playlist Link");
+        // Clean the hash from the URL without reloading
         window.history.replaceState(null, "", window.location.pathname);
+      } catch {
+        // Invalid hash, ignore
       }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -154,7 +48,10 @@ const Index = () => {
 
   const handleLoad = (content: string, src: string) => {
     const parsed = parseM3U(content);
-    if (!parsed.length) { toast.error("No channels found in playlist"); return; }
+    if (!parsed.length) {
+      toast.error("No channels found in playlist");
+      return;
+    }
     setChannels(parsed);
     setSource(src);
     setSearch("");
@@ -172,12 +69,16 @@ const Index = () => {
     return channels.filter((c) => {
       if (categoryFilter !== "all" && c.category !== categoryFilter) return false;
       if (!q) return true;
-      return c.name.toLowerCase().includes(q) || c.category.toLowerCase().includes(q);
+      return (
+        c.name.toLowerCase().includes(q) ||
+        c.category.toLowerCase().includes(q)
+      );
     });
   }, [channels, search, categoryFilter]);
 
   const grouped = useMemo(() => groupByCategory(filtered), [filtered]);
   const groupKeys = useMemo(() => Object.keys(grouped).sort(), [grouped]);
+
   const enabledCount = channels.filter((c) => c.enabled).length;
 
   const updateChannel = (id: string, patch: Partial<Channel>) =>
@@ -187,24 +88,29 @@ const Index = () => {
     const { channels: cleaned, removed } = dedupeByUrl(channels);
     setChannels(cleaned);
     setDuplicatesRemoved((prev) => prev + removed);
-    toast.success(removed > 0 ? `Removed ${removed} duplicate${removed > 1 ? "s" : ""}` : "No duplicates found");
+    toast.success(
+      removed > 0 ? `Removed ${removed} duplicate${removed > 1 ? "s" : ""}` : "No duplicates found"
+    );
   };
 
   const handleEnableAll = (enabled: boolean) =>
     setChannels((prev) => prev.map((c) => ({ ...c, enabled })));
 
   const handleToggleCategoryAll = (category: string, enabled: boolean) =>
-    setChannels((prev) => prev.map((c) => (c.category === category ? { ...c, enabled } : c)));
+    setChannels((prev) =>
+      prev.map((c) => (c.category === category ? { ...c, enabled } : c))
+    );
 
   const handleReset = () => {
-    setChannels([]); setSource(""); setSearch("");
-    setCategoryFilter("all"); setDuplicatesRemoved(0);
+    setChannels([]);
+    setSource("");
+    setSearch("");
+    setCategoryFilter("all");
+    setDuplicatesRemoved(0);
   };
 
-  const getEnabledM3U = (chans: Channel[] = channels) => exportM3U(chans);
-
   const handleDownload = () => {
-    const text = getEnabledM3U();
+    const text = exportM3U(channels);
     const blob = new Blob([text], { type: "audio/x-mpegurl" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -212,75 +118,37 @@ const Index = () => {
     a.download = "team8k-playlist.m3u";
     a.click();
     URL.revokeObjectURL(url);
-    toast.success(`Downloaded — ${enabledCount} enabled channels`);
+    toast.success("Playlist downloaded");
   };
 
   const handleCopy = async () => {
-    const text = getEnabledM3U();
+    const text = exportM3U(channels);
     try {
       await navigator.clipboard.writeText(text);
-      toast.success(`Copied — ${enabledCount} enabled channels`);
+      toast.success("Copied to clipboard");
     } catch {
       toast.error("Clipboard unavailable");
     }
   };
 
-  // ── Google Drive upload ───────────────────────────────────────
-  const doUpload = async (token: string, chans: Channel[] = channels) => {
-    setDriveUploading(true);
+  const handleGetUrl = async () => {
     try {
-      const m3uContent = getEnabledM3U(chans);
-      const existingId = localStorage.getItem("team8k_drive_file_id") || driveFileId || undefined;
-      const fileId = await uploadToDrive(token, m3uContent, existingId);
-
-      const url = `https://drive.google.com/uc?export=download&id=${fileId}`;
-
-      setDriveFileId(fileId);
-      setDriveUrl(url);
-      localStorage.setItem("team8k_drive_file_id", fileId);
-      localStorage.setItem("team8k_drive_url", url);
-
-      await navigator.clipboard.writeText(url).catch(() => {});
-      toast.success(`Saved to Google Drive — ${enabledCount} channels. URL copied!`);
-    } catch (err: any) {
-      toast.error(err.message || "Google Drive upload failed");
-    } finally {
-      setDriveUploading(false);
+      const text = exportM3U(channels);
+      // Encode the playlist as base64 and put it in the URL hash
+      // We use encodeURIComponent so special chars are safe
+      const encoded = btoa(unescape(encodeURIComponent(text)));
+      const url = `${window.location.origin}${window.location.pathname}#playlist=${encoded}`;
+      await navigator.clipboard.writeText(url);
+      toast.success("Playlist URL copied! Anyone with this link can load your edited playlist.");
+    } catch {
+      toast.error("Could not generate URL");
     }
-  };
-
-  const handleSaveToDrive = async () => {
-    if (enabledCount === 0) { toast.error("No enabled channels to save"); return; }
-    if (!GDRIVE_CLIENT_ID) { toast.error("Google Drive not configured"); return; }
-
-    // Check for existing token in session
-    const existingToken = sessionStorage.getItem("team8k_gdrive_token");
-    if (existingToken) {
-      await doUpload(existingToken);
-      return;
-    }
-
-    // No token — save state and redirect to Google OAuth
-    const m3uContent = getEnabledM3U();
-    localStorage.setItem("team8k_pending_m3u", m3uContent);
-    localStorage.setItem("team8k_pending_source", source);
-    localStorage.setItem("team8k_pending_channels", JSON.stringify(channels));
-
-    toast("Redirecting to Google to authorise...");
-    setTimeout(() => {
-      window.location.href = buildAuthUrl();
-    }, 800);
-  };
-
-  const handleCopyDriveUrl = async () => {
-    if (!driveUrl) return;
-    await navigator.clipboard.writeText(driveUrl);
-    toast.success("M3U URL copied to clipboard");
   };
 
   return (
-    <SidebarProvider style={{ minHeight: "unset" }}>
-      <div className="flex w-full pb-16 relative overflow-x-hidden" style={{ minHeight: "unset" }}>
+    <SidebarProvider style={{ minHeight: 'unset' }}>
+      <div className="flex w-full pb-16 relative overflow-x-hidden" style={{ minHeight: 'unset' }}>
+
         {channels.length > 0 && (
           <SummarySidebar
             total={channels.length}
@@ -293,7 +161,9 @@ const Index = () => {
           {channels.length > 0 && (
             <div className="sticky top-16 z-20 h-12 flex items-center border-b border-border/50 backdrop-blur-md px-3 bg-muted opacity-0">
               <SidebarTrigger className="text-primary hover:bg-primary/10" />
-              <span className="ml-3 text-xs tracking-[0.25em] uppercase text-muted-foreground font-display">Summary</span>
+              <span className="ml-3 text-xs tracking-[0.25em] uppercase text-muted-foreground font-display">
+                Summary
+              </span>
             </div>
           )}
           <div className="container max-w-6xl">
@@ -302,153 +172,142 @@ const Index = () => {
             </div>
 
             {channels.length === 0 ? (
-              <main className="animate-fade-in">
-                <div className="text-center mb-10">
-                  <h2 className="font-display font-bold text-3xl mb-3 md:text-4xl text-center">Load Your Playlist</h2>
-                  <p className="text-muted-foreground text-sm">Everything runs in your browser — nothing is stored or uploaded.</p>
+          <main className="animate-fade-in">
+            <div className="text-center mb-10">
+              <h2 className="font-display font-bold text-3xl mb-3 md:text-4xl text-center">
+                Load Your Playlist
+              </h2>
+              <p className="text-muted-foreground text-sm">
+                Everything runs in your browser — nothing is stored or uploaded.
+              </p>
+            </div>
+            <LoaderPanel onLoad={handleLoad} />
+
+            <div className="mt-10 max-w-3xl mx-auto grid grid-cols-2 md:grid-cols-4 gap-3">
+              {[
+                { t: "Edit & Rename", d: "Rename any channel" },
+                { t: "Smart Dedupe", d: "Strip duplicate URLs" },
+                { t: "Group & Filter", d: "Auto-group by category" },
+                { t: "Clean Export", d: "Valid M3U output" },
+              ].map((f) => (
+                <div
+                  key={f.t}
+                  className="bg-gradient-card ring-gold rounded-xl p-5 text-center"
+                >
+                  <h4 className="font-display font-bold text-sm mb-1">{f.t}</h4>
+                  <p className="text-xs text-muted-foreground">{f.d}</p>
                 </div>
-                <LoaderPanel onLoad={handleLoad} />
-                <div className="mt-10 max-w-3xl mx-auto grid grid-cols-2 md:grid-cols-4 gap-3">
-                  {[
-                    { t: "Edit & Rename", d: "Rename any channel" },
-                    { t: "Smart Dedupe", d: "Strip duplicate URLs" },
-                    { t: "Group & Filter", d: "Auto-group by category" },
-                    { t: "Clean Export", d: "Valid M3U output" },
-                  ].map((f) => (
-                    <div key={f.t} className="bg-gradient-card ring-gold rounded-xl p-5 text-center">
-                      <h4 className="font-display font-bold text-sm mb-1">{f.t}</h4>
-                      <p className="text-xs text-muted-foreground">{f.d}</p>
-                    </div>
+              ))}
+            </div>
+          </main>
+        ) : (
+          <main className="animate-fade-in space-y-6">
+            {/* Stats bar */}
+            <div className="bg-gradient-card ring-gold rounded-2xl p-5 md:p-6 shadow-elegant flex flex-wrap items-center gap-4 justify-between">
+              <div className="flex items-center gap-5">
+                <div className="h-12 w-12 rounded-xl bg-primary/10 border border-primary/30 flex items-center justify-center">
+                  <Tv className="h-5 w-5 text-primary" />
+                </div>
+                <div>
+                  <p className="text-xs text-muted-foreground truncate max-w-[280px]">
+                    {source}
+                  </p>
+                  <p className="font-display font-bold text-lg">
+                    <span className="text-gradient-gold">{enabledCount}</span>
+                    <span className="text-muted-foreground"> / {channels.length} enabled</span>
+                    <span className="text-muted-foreground text-sm font-normal"> · {categories.length} categories</span>
+                  </p>
+                </div>
+              </div>
+              <div className="flex gap-2 flex-wrap">
+                <Button variant="goldOutline" size="sm" onClick={() => handleEnableAll(true)}>
+                  <ToggleLeft className="h-4 w-4" /> Enable all
+                </Button>
+                <Button variant="goldOutline" size="sm" onClick={() => handleEnableAll(false)}>
+                  Disable all
+                </Button>
+                <Button variant="goldOutline" size="sm" onClick={handleDedupe}>
+                  <Trash2 className="h-4 w-4" /> Dedupe
+                </Button>
+                <Button variant="goldOutline" size="sm" onClick={handleReset}>
+                  <RotateCcw className="h-4 w-4" /> Reset
+                </Button>
+              </div>
+            </div>
+
+            {/* Filters */}
+            <div className="bg-gradient-card ring-gold rounded-2xl p-4 md:p-5 flex flex-col md:flex-row gap-3">
+              <div className="relative flex-1">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+                <Input
+                  placeholder="Search channels…"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  className="pl-9 bg-background/60 border-border focus-visible:ring-primary"
+                />
+              </div>
+              <Select value={categoryFilter} onValueChange={setCategoryFilter}>
+                <SelectTrigger className="md:w-64 bg-background/60 border-border">
+                  <SelectValue placeholder="All categories" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All categories</SelectItem>
+                  {categories.map((c) => (
+                    <SelectItem key={c} value={c}>
+                      {c}
+                    </SelectItem>
                   ))}
-                </div>
-              </main>
-            ) : (
-              <main className="animate-fade-in space-y-6">
-                {/* Stats bar */}
-                <div className="bg-gradient-card ring-gold rounded-2xl p-5 md:p-6 shadow-elegant flex flex-wrap items-center gap-4 justify-between">
-                  <div className="flex items-center gap-5">
-                    <div className="h-12 w-12 rounded-xl bg-primary/10 border border-primary/30 flex items-center justify-center">
-                      <Tv className="h-5 w-5 text-primary" />
-                    </div>
-                    <div>
-                      <p className="text-xs text-muted-foreground truncate max-w-[280px]">{source}</p>
-                      <p className="font-display font-bold text-lg">
-                        <span className="text-gradient-gold">{enabledCount}</span>
-                        <span className="text-muted-foreground"> / {channels.length} enabled</span>
-                        <span className="text-muted-foreground text-sm font-normal"> · {categories.length} categories</span>
-                      </p>
-                    </div>
-                  </div>
-                  <div className="flex gap-2 flex-wrap">
-                    <Button variant="goldOutline" size="sm" onClick={() => handleEnableAll(true)}>
-                      <ToggleLeft className="h-4 w-4" /> Enable all
-                    </Button>
-                    <Button variant="goldOutline" size="sm" onClick={() => handleEnableAll(false)}>Disable all</Button>
-                    <Button variant="goldOutline" size="sm" onClick={handleDedupe}>
-                      <Trash2 className="h-4 w-4" /> Dedupe
-                    </Button>
-                    <Button variant="goldOutline" size="sm" onClick={handleReset}>
-                      <RotateCcw className="h-4 w-4" /> Reset
-                    </Button>
-                  </div>
-                </div>
+                </SelectContent>
+              </Select>
+            </div>
 
-                {/* Filters */}
-                <div className="bg-gradient-card ring-gold rounded-2xl p-4 md:p-5 flex flex-col md:flex-row gap-3">
-                  <div className="relative flex-1">
-                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                    <Input
-                      placeholder="Search channels…"
-                      value={search}
-                      onChange={(e) => setSearch(e.target.value)}
-                      className="pl-9 bg-background/60 border-border focus-visible:ring-primary"
-                    />
-                  </div>
-                  <Select value={categoryFilter} onValueChange={setCategoryFilter}>
-                    <SelectTrigger className="md:w-64 bg-background/60 border-border">
-                      <SelectValue placeholder="All categories" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">All categories</SelectItem>
-                      {categories.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}
-                    </SelectContent>
-                  </Select>
+            {/* Groups */}
+            <div className="space-y-4">
+              {groupKeys.length === 0 ? (
+                <div className="bg-gradient-card ring-gold rounded-2xl p-12 text-center text-muted-foreground">
+                  No channels match your filters.
                 </div>
+              ) : (
+                groupKeys.map((cat) => (
+                  <CategoryGroup
+                    key={cat}
+                    category={cat}
+                    channels={grouped[cat]}
+                    defaultOpen={groupKeys.length <= 3 || !!search}
+                    onToggle={(id, enabled) => updateChannel(id, { enabled })}
+                    onRename={(id, name) => updateChannel(id, { name })}
+                    onToggleAll={handleToggleCategoryAll}
+                  />
+                ))
+              )}
+            </div>
 
-                {/* Channel groups */}
-                <div className="space-y-4">
-                  {groupKeys.length === 0 ? (
-                    <div className="bg-gradient-card ring-gold rounded-2xl p-12 text-center text-muted-foreground">
-                      No channels match your filters.
-                    </div>
-                  ) : (
-                    groupKeys.map((cat) => (
-                      <CategoryGroup
-                        key={cat}
-                        category={cat}
-                        channels={grouped[cat]}
-                        defaultOpen={groupKeys.length <= 3 || !!search}
-                        onToggle={(id, enabled) => updateChannel(id, { enabled })}
-                        onRename={(id, name) => updateChannel(id, { name })}
-                        onToggleAll={handleToggleCategoryAll}
-                      />
-                    ))
-                  )}
+            {/* Export bar (sticky) */}
+            <div className="sticky bottom-4 z-10">
+              <div className="bg-gradient-card ring-gold rounded-2xl p-4 md:p-5 shadow-gold backdrop-blur-md flex flex-wrap gap-3 justify-between items-center">
+                <p className="text-sm">
+                  <span className="text-muted-foreground">Ready to export </span>
+                  <span className="text-gradient-gold font-display font-bold">
+                    {enabledCount}
+                  </span>
+                  <span className="text-muted-foreground"> channels</span>
+                </p>
+                <div className="flex gap-2 flex-wrap">
+                  <Button variant="goldOutline" onClick={handleCopy}>
+                    <Copy className="h-4 w-4" /> Copy
+                  </Button>
+                  <Button variant="goldOutline" onClick={handleGetUrl}>
+                    <Link className="h-4 w-4" /> Get URL
+                  </Button>
+                  <Button variant="gold" onClick={handleDownload}>
+                    <Download className="h-4 w-4" /> Download M3U
+                  </Button>
                 </div>
+              </div>
+            </div>
+          </main>
+        )}
 
-                {/* Google Drive URL display */}
-                {driveUrl && (
-                  <div className="bg-gradient-card ring-gold rounded-2xl p-4 md:p-5 space-y-3">
-                    <div className="flex items-center gap-2">
-                      <Check className="h-4 w-4 text-green-500" />
-                      <p className="text-sm font-display font-bold text-green-500">Saved to Google Drive</p>
-                    </div>
-                    <p className="text-xs text-muted-foreground">
-                      Paste this URL into Tivimate, Smarters, or any IPTV player as your M3U source.
-                      Every time you edit and click "Save to Drive", this same URL updates automatically.
-                    </p>
-                    <div className="flex gap-2 items-center">
-                      <code className="flex-1 text-xs bg-background/60 border border-border rounded-lg px-3 py-2 truncate text-primary">
-                        {driveUrl}
-                      </code>
-                      <Button variant="goldOutline" size="sm" onClick={handleCopyDriveUrl}>
-                        <Copy className="h-3.5 w-3.5" />
-                      </Button>
-                      <Button variant="goldOutline" size="sm" onClick={() => window.open(driveUrl, "_blank")}>
-                        <ExternalLink className="h-3.5 w-3.5" />
-                      </Button>
-                    </div>
-                  </div>
-                )}
-
-                {/* Export bar */}
-                <div className="sticky bottom-0 z-30">
-                  <div className="bg-gradient-card ring-gold rounded-2xl p-4 md:p-5 shadow-gold backdrop-blur-md flex flex-wrap gap-3 justify-between items-center">
-                    <p className="text-sm">
-                      <span className="text-muted-foreground">Ready to export </span>
-                      <span className="text-gradient-gold font-display font-bold">{enabledCount}</span>
-                      <span className="text-muted-foreground"> channels</span>
-                    </p>
-                    <div className="flex gap-2 flex-wrap">
-                      <Button variant="goldOutline" onClick={handleCopy}>
-                        <Copy className="h-4 w-4" /> Copy
-                      </Button>
-                      <Button
-                        variant="goldOutline"
-                        onClick={handleSaveToDrive}
-                        disabled={driveUploading}
-                      >
-                        <CloudUpload className="h-4 w-4" />
-                        {driveUploading ? "Saving…" : driveFileId ? "Update Drive" : "Save to Drive"}
-                      </Button>
-                      <Button variant="gold" onClick={handleDownload}>
-                        <Download className="h-4 w-4" /> Download M3U
-                      </Button>
-                    </div>
-                  </div>
-                </div>
-              </main>
-            )}
           </div>
         </div>
       </div>
