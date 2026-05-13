@@ -133,13 +133,12 @@ const Index = () => {
 
   const handleGetUrl = async () => {
     try {
-      const text = exportM3U(channels);
-      // Encode the playlist as base64 and put it in the URL hash
-      // We use encodeURIComponent so special chars are safe
+      const enabledOnly = channels.filter((c) => c.enabled);
+      const text = exportM3U(enabledOnly);
       const encoded = btoa(unescape(encodeURIComponent(text)));
       const url = `${window.location.origin}${window.location.pathname}#playlist=${encoded}`;
       await navigator.clipboard.writeText(url);
-      toast.success("Playlist URL copied! Anyone with this link can load your edited playlist.");
+      toast.success(`URL copied — ${enabledOnly.length} enabled channels encoded.`);
     } catch {
       toast.error("Could not generate URL");
     }
@@ -283,7 +282,7 @@ const Index = () => {
             </div>
 
             {/* Export bar (sticky) */}
-            <div className="sticky bottom-4 z-10">
+            <div className="sticky bottom-0 z-30">
               <div className="bg-gradient-card ring-gold rounded-2xl p-4 md:p-5 shadow-gold backdrop-blur-md flex flex-wrap gap-3 justify-between items-center">
                 <p className="text-sm">
                   <span className="text-muted-foreground">Ready to export </span>
