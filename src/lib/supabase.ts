@@ -1,83 +1,103 @@
 import { createClient } from "@supabase/supabase-js";
 
-const url = import.meta.env.VITE_SUPABASE_URL as string;
-const key = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
+// ── These come from Netlify environment variables ─────────────────────────
+// In your Netlify dashboard: Site → Environment variables → add:
+//   VITE_SUPABASE_URL      = https://xxxx.supabase.co
+//   VITE_SUPABASE_ANON_KEY = eyJ...
+const supabaseUrl  = import.meta.env.VITE_SUPABASE_URL  as string;
+const supabaseAnon = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
 
-if (!url || !key) {
-  console.warn(
-    "[Supabase] VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY is missing. " +
-      "Cloud save/load will be disabled until you add these to your .env file."
+if (!supabaseUrl || !supabaseAnon) {
+  throw new Error(
+    "Missing Supabase env vars. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY."
   );
 }
 
-export const supabase = url && key ? createClient(url, key) : null;
+export const supabase = createClient(supabaseUrl, supabaseAnon);
 
-// ── Types ──────────────────────────────────────────────────────────────────
+// ── Typed helpers ────────────────────────────────────────────────────────
 
-export interface SavedPlaylist {
+export type SourcePlaylistRow = {
   id: string;
-  user_email: string;
+  user_id: string;
   name: string;
-  content: string;
+  source_type: "file" | "url" | "xtream";
+  url?: string | null;
+  xtream_host?: string | null;
+  xtream_user?: string | null;
+  storage_path?: string | null;
+  channel_count: number;
+  created_at: string;
   updated_at: string;
-}
+};
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+export type EditedPlaylistRow = {
+  id: string;
+  user_id: string;
+  source_playlist_id?: string | null;
+  name: string;
+  content?: string | null;
+  storage_path?: string | null;
+  channel_count: number;
+  enabled_count: number;
+  created_at: string;
+  updated_at: string;
+};
 
-export async function fetchPlaylists(
-  userEmail: string
-): Promise<SavedPlaylist[]> {
-  if (!supabase) return [];
-  const { data, error } = await supabase
-    .from("playlists")
-    .select("*")
-    .eq("user_email", userEmail)
-    .order("updated_at", { ascending: false });
+// ── Save source playlist metadata ────────────────────────────────────────
+export async function saveSourcePlaylist(
+  data: Omit<SourcePlaylistRow, "id" | "user_id" | "created_at" | "updated_at">
+) {
+  const { data: session } = await supabase.auth.getSession();
+  const uid = session?.session?.user?.id;
+  if (!uid) throw new Error("Not authenticated");
 
-  if (error) throw new Error(error.message);
-  return (data as SavedPlaylist[]) ?? [];
-}
-
-export async function savePlaylist(
-  userEmail: string,
-  name: string,
-  content: string,
-  existingId?: string
-): Promise<SavedPlaylist> {
-  if (!supabase) throw new Error("Supabase not configured.");
-
-  if (existingId) {
-    // Update existing row
-    const { data, error } = await supabase
-      .from("playlists")
-      .update({ name, content, updated_at: new Date().toISOString() })
-      .eq("id", existingId)
-      .eq("user_email", userEmail)
-      .select()
-      .single();
-    if (error) throw new Error(error.message);
-    return data as SavedPlaylist;
-  }
-
-  // Insert new row
-  const { data, error } = await supabase
-    .from("playlists")
-    .insert({ user_email: userEmail, name, content })
+  const { data: row, error } = await supabase
+    .from("source_playlists")
+    .insert({ ...data, user_id: uid })
     .select()
     .single();
-  if (error) throw new Error(error.message);
-  return data as SavedPlaylist;
+
+  if (error) throw error;
+  return row as SourcePlaylistRow;
 }
 
-export async function deletePlaylist(
-  userEmail: string,
-  id: string
-): Promise<void> {
-  if (!supabase) throw new Error("Supabase not configured.");
-  const { error } = await supabase
-    .from("playlists")
-    .delete()
-    .eq("id", id)
-    .eq("user_email", userEmail);
-  if (error) throw new Error(error.message);
+// ── Save edited playlist ─────────────────────────────────────────────────
+export async function saveEditedPlaylist(
+  data: Omit<EditedPlaylistRow, "id" | "user_id" | "created_at" | "updated_at">
+) {
+  const { data: session } = await supabase.auth.getSession();
+  const uid = session?.session?.user?.id;
+  if (!uid) throw new Error("Not authenticated");
+
+  const { data: row, error } = await supabase
+    .from("edited_playlists")
+    .insert({ ...data, user_id: uid })
+    .select()
+    .single();
+
+  if (error) throw error;
+  return row as EditedPlaylistRow;
+}
+
+// ── Upload file to a user-scoped storage path ────────────────────────────
+export async function uploadPlaylistFile(
+  bucket: "source-playlists" | "edited-playlists",
+  filename: string,
+  content: string
+): Promise<string> {
+  const { data: session } = await supabase.auth.getSession();
+  const uid = session?.session?.user?.id;
+  if (!uid) throw new Error("Not authenticated");
+
+  const path = `${uid}/${filename}`;
+  const blob = new Blob([content], { type: "audio/x-mpegurl" });
+
+  const { error } = await supabase.storage.from(bucket).upload(path, blob, {
+    upsert: true,
+    contentType: "audio/x-mpegurl",
+  });
+
+  if (error) throw error;
+  return path;
 }
