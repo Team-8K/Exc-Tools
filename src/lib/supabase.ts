@@ -1,9 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
 
-// ── These come from Netlify environment variables ─────────────────────────
-// In your Netlify dashboard: Site → Environment variables → add:
-//   VITE_SUPABASE_URL      = https://xxxx.supabase.co
-//   VITE_SUPABASE_ANON_KEY = eyJ...
 const supabaseUrl  = import.meta.env.VITE_SUPABASE_URL  as string;
 const supabaseAnon = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
 
@@ -15,7 +11,7 @@ if (!supabaseUrl || !supabaseAnon) {
 
 export const supabase = createClient(supabaseUrl, supabaseAnon);
 
-// ── Typed helpers ────────────────────────────────────────────────────────
+// ── Types ────────────────────────────────────────────────────────────────
 
 export type SourcePlaylistRow = {
   id: string;
@@ -44,52 +40,91 @@ export type EditedPlaylistRow = {
   updated_at: string;
 };
 
-// ── Save source playlist metadata ────────────────────────────────────────
-export async function saveSourcePlaylist(
+// ── Helpers ──────────────────────────────────────────────────────────────
+
+async function getUid(): Promise<string> {
+  const { data } = await supabase.auth.getSession();
+  const uid = data?.session?.user?.id;
+  if (!uid) throw new Error("Not authenticated");
+  return uid;
+}
+
+// ── Source playlist — upsert (one per user) ──────────────────────────────
+export async function upsertSourcePlaylist(
   data: Omit<SourcePlaylistRow, "id" | "user_id" | "created_at" | "updated_at">
-) {
-  const { data: session } = await supabase.auth.getSession();
-  const uid = session?.session?.user?.id;
-  if (!uid) throw new Error("Not authenticated");
+): Promise<SourcePlaylistRow> {
+  const uid = await getUid();
 
-  const { data: row, error } = await supabase
+  const { data: existing } = await supabase
     .from("source_playlists")
-    .insert({ ...data, user_id: uid })
-    .select()
-    .single();
+    .select("id")
+    .eq("user_id", uid)
+    .maybeSingle();
 
-  if (error) throw error;
-  return row as SourcePlaylistRow;
+  if (existing?.id) {
+    const { data: row, error } = await supabase
+      .from("source_playlists")
+      .update({ ...data })
+      .eq("id", existing.id)
+      .select()
+      .single();
+    if (error) throw error;
+    return row as SourcePlaylistRow;
+  } else {
+    const { data: row, error } = await supabase
+      .from("source_playlists")
+      .insert({ ...data, user_id: uid })
+      .select()
+      .single();
+    if (error) throw error;
+    return row as SourcePlaylistRow;
+  }
 }
 
-// ── Save edited playlist ─────────────────────────────────────────────────
-export async function saveEditedPlaylist(
+// ── Edited playlist — upsert (one per user) ──────────────────────────────
+export async function upsertEditedPlaylist(
   data: Omit<EditedPlaylistRow, "id" | "user_id" | "created_at" | "updated_at">
-) {
-  const { data: session } = await supabase.auth.getSession();
-  const uid = session?.session?.user?.id;
-  if (!uid) throw new Error("Not authenticated");
+): Promise<EditedPlaylistRow> {
+  const uid = await getUid();
 
-  const { data: row, error } = await supabase
+  const { data: existing } = await supabase
     .from("edited_playlists")
-    .insert({ ...data, user_id: uid })
-    .select()
-    .single();
+    .select("id, storage_path")
+    .eq("user_id", uid)
+    .maybeSingle();
 
-  if (error) throw error;
-  return row as EditedPlaylistRow;
+  if (existing?.id) {
+    if (existing.storage_path && existing.storage_path !== data.storage_path) {
+      await supabase.storage
+        .from("edited-playlists")
+        .remove([existing.storage_path]);
+    }
+    const { data: row, error } = await supabase
+      .from("edited_playlists")
+      .update({ ...data })
+      .eq("id", existing.id)
+      .select()
+      .single();
+    if (error) throw error;
+    return row as EditedPlaylistRow;
+  } else {
+    const { data: row, error } = await supabase
+      .from("edited_playlists")
+      .insert({ ...data, user_id: uid })
+      .select()
+      .single();
+    if (error) throw error;
+    return row as EditedPlaylistRow;
+  }
 }
 
-// ── Upload file to a user-scoped storage path ────────────────────────────
+// ── Upload file to storage ────────────────────────────────────────────────
 export async function uploadPlaylistFile(
   bucket: "source-playlists" | "edited-playlists",
   filename: string,
   content: string
 ): Promise<string> {
-  const { data: session } = await supabase.auth.getSession();
-  const uid = session?.session?.user?.id;
-  if (!uid) throw new Error("Not authenticated");
-
+  const uid = await getUid();
   const path = `${uid}/${filename}`;
   const blob = new Blob([content], { type: "audio/x-mpegurl" });
 
@@ -101,3 +136,7 @@ export async function uploadPlaylistFile(
   if (error) throw error;
   return path;
 }
+
+// ── Legacy aliases ────────────────────────────────────────────────────────
+export const saveSourcePlaylist = upsertSourcePlaylist;
+export const saveEditedPlaylist = upsertEditedPlaylist;

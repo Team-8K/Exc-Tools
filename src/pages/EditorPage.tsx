@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState, useCallback } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   Search, Trash2, Download, Copy, RotateCcw, Tv,
-  ToggleLeft, Link as LinkIcon, Save, ChevronLeft,
+  ToggleLeft, Link as LinkIcon, Save, ChevronLeft, RefreshCw,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -14,27 +14,30 @@ import { toast } from "sonner";
 import { LoaderPanel } from "@/components/LoaderPanel";
 import { CategoryGroup } from "@/components/CategoryGroup";
 import { SummarySidebar } from "@/components/SummarySidebar";
-import { Channel, parseM3U, exportM3U, dedupeByUrl, groupByCategory } from "@/lib/m3u";
+import {
+  Channel, parseM3U, exportM3U, dedupeByUrl, groupByCategory,
+} from "@/lib/m3u";
 import {
   supabase,
-  saveSourcePlaylist,
-  saveEditedPlaylist,
+  upsertSourcePlaylist,
+  upsertEditedPlaylist,
   uploadPlaylistFile,
   type SourcePlaylistRow,
 } from "@/lib/supabase";
 
 export default function EditorPage() {
-  const navigate      = useNavigate();
-  const [params]      = useSearchParams();
-  const sourceId      = params.get("source");
+  const navigate     = useNavigate();
+  const [params]     = useSearchParams();
+  const sourceId     = params.get("source");
 
-  const [channels, setChannels]   = useState<Channel[]>([]);
-  const [source,   setSource]     = useState<string>("");
-  const [sourceRow, setSourceRow] = useState<SourcePlaylistRow | null>(null);
-  const [search,   setSearch]     = useState("");
-  const [catFilter, setCatFilter] = useState<string>("all");
-  const [dupes,    setDupes]      = useState(0);
-  const [saving,   setSaving]     = useState(false);
+  const [channels,   setChannels]   = useState<Channel[]>([]);
+  const [source,     setSource]     = useState<string>("");
+  const [sourceRow,  setSourceRow]  = useState<SourcePlaylistRow | null>(null);
+  const [search,     setSearch]     = useState("");
+  const [catFilter,  setCatFilter]  = useState<string>("all");
+  const [dupes,      setDupes]      = useState(0);
+  const [saving,     setSaving]     = useState(false);
+  const [resyncing,  setResyncing]  = useState(false);
 
   // ── Load from dashboard sourceId ─────────────────────────────
   useEffect(() => {
@@ -50,7 +53,6 @@ export default function EditorPage() {
       setSourceRow(row);
 
       if (row.source_type === "url" && row.url) {
-        // Re-fetch via proxy
         const res = await fetch("/api/m3u-proxy", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -60,7 +62,18 @@ export default function EditorPage() {
         const text = await res.text();
         handleLoad(text, row.name, row);
       } else if (row.source_type === "xtream" && row.xtream_host && row.xtream_user) {
-        toast.info("Xtream playlists cannot be re-fetched without your password. Load again from the loader.");
+        toast.info(
+          "Xtream playlist loaded from your saved source. Use Resync to re-fetch live data.",
+          { duration: 5000 }
+        );
+        if (row.storage_path) {
+          const { data: file, error: fe } = await supabase.storage
+            .from("source-playlists")
+            .download(row.storage_path);
+          if (fe || !file) { toast.error("Could not download saved playlist file"); return; }
+          const text = await file.text();
+          handleLoad(text, row.name, row);
+        }
       } else if (row.storage_path) {
         const { data: file, error: fe } = await supabase.storage
           .from("source-playlists")
@@ -73,12 +86,17 @@ export default function EditorPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sourceId]);
 
-  // ── Handle new load (from LoaderPanel or re-fetch) ───────────
+  // ── Handle new load ───────────────────────────────────────────
   const handleLoad = useCallback(async (
     content: string,
     src: string,
     existingRow?: SourcePlaylistRow | null,
-    meta?: { type: "file" | "url" | "xtream"; url?: string; xtream_host?: string; xtream_user?: string }
+    meta?: {
+      type: "file" | "url" | "xtream";
+      url?: string;
+      xtream_host?: string;
+      xtream_user?: string;
+    }
   ) => {
     const parsed = parseM3U(content);
     if (!parsed.length) { toast.error("No channels found in playlist"); return; }
@@ -88,10 +106,10 @@ export default function EditorPage() {
     setCatFilter("all");
     setDupes(0);
 
-    // Auto-save source playlist record if new (not re-opened from dashboard)
     if (!existingRow) {
+      // Auto-save source playlist (upsert — replaces previous source)
       try {
-        const row = await saveSourcePlaylist({
+        const row = await upsertSourcePlaylist({
           name: src,
           source_type: meta?.type ?? "url",
           url: meta?.url ?? null,
@@ -100,24 +118,81 @@ export default function EditorPage() {
           channel_count: parsed.length,
         });
         setSourceRow(row);
-      } catch {
-        // Non-fatal — user still works, just not persisted yet
+        toast.success("Source playlist saved to dashboard");
+      } catch (err: any) {
+        toast.error(`Could not save source: ${err?.message || "unknown error"}`);
       }
     } else {
       setSourceRow(existingRow);
     }
   }, []);
 
-  // ── Expose handleLoad to LoaderPanel (which calls onLoad) ────
   const onLoadFromPanel = useCallback((
     content: string,
     src: string,
-    meta?: { type: "file" | "url" | "xtream"; url?: string; xtream_host?: string; xtream_user?: string }
+    meta?: {
+      type: "file" | "url" | "xtream";
+      url?: string;
+      xtream_host?: string;
+      xtream_user?: string;
+    }
   ) => {
     handleLoad(content, src, null, meta);
   }, [handleLoad]);
 
-  // ── Save edited playlist to Supabase ─────────────────────────
+  // ── Resync source from provider ───────────────────────────────
+  const handleResync = async () => {
+    if (!sourceRow) return;
+    if (sourceRow.source_type === "file") return; // can't resync a file
+
+    setResyncing(true);
+    try {
+      let content = "";
+      let sourceName = sourceRow.name;
+
+      if (sourceRow.source_type === "url" && sourceRow.url) {
+        const res = await fetch("/api/m3u-proxy", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: sourceRow.url }),
+        });
+        if (!res.ok) { toast.error("Could not re-fetch playlist URL"); return; }
+        content = await res.text();
+      } else if (sourceRow.source_type === "xtream" && sourceRow.xtream_host && sourceRow.xtream_user) {
+        toast.error(
+          "Xtream resync requires your provider password. Please reload via the loader panel."
+        );
+        return;
+      }
+
+      const parsed = parseM3U(content);
+      if (!parsed.length) { toast.error("No channels found after resync"); return; }
+
+      setChannels(parsed);
+      setSource(sourceName);
+      setSearch("");
+      setCatFilter("all");
+      setDupes(0);
+
+      // Update source record with new channel count
+      const updated = await upsertSourcePlaylist({
+        name: sourceName,
+        source_type: sourceRow.source_type,
+        url: sourceRow.url ?? null,
+        xtream_host: sourceRow.xtream_host ?? null,
+        xtream_user: sourceRow.xtream_user ?? null,
+        channel_count: parsed.length,
+      });
+      setSourceRow(updated);
+      toast.success(`Resynced — ${parsed.length.toLocaleString()} channels loaded`);
+    } catch (err: any) {
+      toast.error(err?.message || "Resync failed");
+    } finally {
+      setResyncing(false);
+    }
+  };
+
+  // ── Save edited playlist to Supabase (upsert) ─────────────────
   const handleSaveToDashboard = async () => {
     if (!channels.length) return;
     setSaving(true);
@@ -125,17 +200,16 @@ export default function EditorPage() {
       const enabled  = channels.filter(c => c.enabled);
       const m3uText  = exportM3U(channels);
       const name     = source || "My Playlist";
-      const filename = `${Date.now()}-${name.replace(/\s+/g, "-").slice(0, 40)}.m3u`;
+      const filename = `edited-${Date.now()}.m3u`;
 
-      // Upload file to storage
       let storagePath: string | undefined;
       try {
         storagePath = await uploadPlaylistFile("edited-playlists", filename, m3uText);
       } catch {
-        // Storage optional — fall back to inline content if small enough
+        // Storage optional — fall back to inline if small enough
       }
 
-      await saveEditedPlaylist({
+      await upsertEditedPlaylist({
         source_playlist_id: sourceRow?.id ?? null,
         name,
         content: !storagePath ? m3uText : null,
@@ -144,7 +218,7 @@ export default function EditorPage() {
         enabled_count: enabled.length,
       });
 
-      toast.success("Saved to dashboard!");
+      toast.success("Playlist saved to dashboard!");
     } catch (err: any) {
       toast.error(err?.message || "Save failed");
     } finally {
@@ -152,7 +226,8 @@ export default function EditorPage() {
     }
   };
 
-  const categories   = useMemo(() => Array.from(new Set(channels.map(c => c.category))).sort(), [channels]);
+  const categories   = useMemo(() =>
+    Array.from(new Set(channels.map(c => c.category))).sort(), [channels]);
   const filtered     = useMemo(() => {
     const q = search.trim().toLowerCase();
     return channels.filter(c => {
@@ -172,16 +247,21 @@ export default function EditorPage() {
     const { channels: cleaned, removed } = dedupeByUrl(channels);
     setChannels(cleaned);
     setDupes(p => p + removed);
-    toast.success(removed > 0 ? `Removed ${removed} duplicate${removed > 1 ? "s" : ""}` : "No duplicates found");
+    toast.success(
+      removed > 0
+        ? `Removed ${removed} duplicate${removed > 1 ? "s" : ""}`
+        : "No duplicates found"
+    );
   };
 
-  const handleEnableAll = (enabled: boolean) => setChannels(prev => prev.map(c => ({ ...c, enabled })));
-  const handleToggleCat = (cat: string, enabled: boolean) =>
+  const handleEnableAll  = (enabled: boolean) =>
+    setChannels(prev => prev.map(c => ({ ...c, enabled })));
+  const handleToggleCat  = (cat: string, enabled: boolean) =>
     setChannels(prev => prev.map(c => c.category === cat ? { ...c, enabled } : c));
 
   const handleReset = () => {
-    setChannels([]); setSource(""); setSearch(""); setCatFilter("all"); setDupes(0);
-    setSourceRow(null);
+    setChannels([]); setSource(""); setSearch("");
+    setCatFilter("all"); setDupes(0); setSourceRow(null);
   };
 
   const handleDownload = () => {
@@ -211,6 +291,8 @@ export default function EditorPage() {
     } catch { toast.error("Could not generate URL"); }
   };
 
+  const canResync = sourceRow && sourceRow.source_type !== "file";
+
   return (
     <div className="min-h-screen">
       {/* Back to dashboard */}
@@ -225,7 +307,10 @@ export default function EditorPage() {
       </div>
 
       <SidebarProvider style={{ minHeight: "unset" }}>
-        <div className="flex w-full pb-16 relative overflow-x-hidden" style={{ minHeight: "unset" }}>
+        <div
+          className="flex w-full pb-16 relative overflow-x-hidden"
+          style={{ minHeight: "unset" }}
+        >
           {channels.length > 0 && (
             <SummarySidebar
               total={channels.length}
@@ -257,7 +342,8 @@ export default function EditorPage() {
                       Load Your Playlist
                     </h2>
                     <p className="text-muted-foreground text-sm">
-                      Everything runs in your browser — your source is saved to your dashboard automatically.
+                      Everything runs in your browser — your source is saved to
+                      your dashboard automatically.
                     </p>
                   </div>
                   <LoaderPanel onLoad={onLoadFromPanel} />
@@ -284,15 +370,31 @@ export default function EditorPage() {
                         <Tv className="h-5 w-5 text-primary" />
                       </div>
                       <div>
-                        <p className="text-xs text-muted-foreground truncate max-w-[280px]">{source}</p>
+                        <p className="text-xs text-muted-foreground truncate max-w-[280px]">
+                          {source}
+                        </p>
                         <p className="font-display font-bold text-lg">
                           <span className="text-gradient-gold">{enabledCount}</span>
                           <span className="text-muted-foreground"> / {channels.length} enabled</span>
-                          <span className="text-muted-foreground text-sm font-normal"> · {categories.length} categories</span>
+                          <span className="text-muted-foreground text-sm font-normal">
+                            {" "}· {categories.length} categories
+                          </span>
                         </p>
                       </div>
                     </div>
                     <div className="flex gap-2 flex-wrap">
+                      {canResync && (
+                        <Button
+                          variant="goldOutline"
+                          size="sm"
+                          onClick={handleResync}
+                          disabled={resyncing}
+                          title="Re-fetch latest channels from your provider"
+                        >
+                          <RefreshCw className={`h-4 w-4 ${resyncing ? "animate-spin" : ""}`} />
+                          {resyncing ? "Syncing…" : "Resync"}
+                        </Button>
+                      )}
                       <Button variant="goldOutline" size="sm" onClick={() => handleEnableAll(true)}>
                         <ToggleLeft className="h-4 w-4" /> Enable all
                       </Button>
@@ -325,7 +427,9 @@ export default function EditorPage() {
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="all">All categories</SelectItem>
-                        {categories.map(c => <SelectItem key={c} value={c}>{c}</SelectItem>)}
+                        {categories.map(c => (
+                          <SelectItem key={c} value={c}>{c}</SelectItem>
+                        ))}
                       </SelectContent>
                     </Select>
                   </div>
@@ -369,7 +473,11 @@ export default function EditorPage() {
                         <Button variant="goldOutline" onClick={handleDownload}>
                           <Download className="h-4 w-4" /> Download
                         </Button>
-                        <Button variant="gold" onClick={handleSaveToDashboard} disabled={saving}>
+                        <Button
+                          variant="gold"
+                          onClick={handleSaveToDashboard}
+                          disabled={saving}
+                        >
                           <Save className="h-4 w-4" />
                           {saving ? "Saving…" : "Save to Dashboard"}
                         </Button>
