@@ -40,7 +40,7 @@ export type EditedPlaylistRow = {
   updated_at: string;
 };
 
-// ── Helpers ──────────────────────────────────────────────────────────────
+// ── Auth helper ───────────────────────────────────────────────────────────
 
 async function getUid(): Promise<string> {
   const { data } = await supabase.auth.getSession();
@@ -81,41 +81,59 @@ export async function upsertSourcePlaylist(
   }
 }
 
-// ── Edited playlist — upsert (one per user) ──────────────────────────────
-export async function upsertEditedPlaylist(
+// ── Edited playlists — multiple per user ─────────────────────────────────
+
+/** Save a brand-new named edited playlist (always creates a new row) */
+export async function saveNewEditedPlaylist(
   data: Omit<EditedPlaylistRow, "id" | "user_id" | "created_at" | "updated_at">
 ): Promise<EditedPlaylistRow> {
   const uid = await getUid();
-
-  const { data: existing } = await supabase
+  const { data: row, error } = await supabase
     .from("edited_playlists")
-    .select("id, storage_path")
-    .eq("user_id", uid)
-    .maybeSingle();
+    .insert({ ...data, user_id: uid })
+    .select()
+    .single();
+  if (error) throw error;
+  return row as EditedPlaylistRow;
+}
 
-  if (existing?.id) {
-    if (existing.storage_path && existing.storage_path !== data.storage_path) {
-      await supabase.storage
-        .from("edited-playlists")
-        .remove([existing.storage_path]);
-    }
-    const { data: row, error } = await supabase
-      .from("edited_playlists")
-      .update({ ...data })
-      .eq("id", existing.id)
-      .select()
-      .single();
-    if (error) throw error;
-    return row as EditedPlaylistRow;
-  } else {
-    const { data: row, error } = await supabase
-      .from("edited_playlists")
-      .insert({ ...data, user_id: uid })
-      .select()
-      .single();
-    if (error) throw error;
-    return row as EditedPlaylistRow;
+/** Overwrite an existing edited playlist by id */
+export async function updateEditedPlaylist(
+  id: string,
+  patch: Partial<Omit<EditedPlaylistRow, "id" | "user_id" | "created_at" | "updated_at">>
+): Promise<EditedPlaylistRow> {
+  const { data: row, error } = await supabase
+    .from("edited_playlists")
+    .update({ ...patch })
+    .eq("id", id)
+    .select()
+    .single();
+  if (error) throw error;
+  return row as EditedPlaylistRow;
+}
+
+/** Fetch all edited playlists for the current user, newest first */
+export async function listEditedPlaylists(): Promise<EditedPlaylistRow[]> {
+  const uid = await getUid();
+  const { data, error } = await supabase
+    .from("edited_playlists")
+    .select("*")
+    .eq("user_id", uid)
+    .order("updated_at", { ascending: false });
+  if (error) throw error;
+  return (data ?? []) as EditedPlaylistRow[];
+}
+
+/** Delete one edited playlist (and its storage file if any) */
+export async function deleteEditedPlaylist(row: EditedPlaylistRow): Promise<void> {
+  if (row.storage_path) {
+    await supabase.storage.from("edited-playlists").remove([row.storage_path]);
   }
+  const { error } = await supabase
+    .from("edited_playlists")
+    .delete()
+    .eq("id", row.id);
+  if (error) throw error;
 }
 
 // ── Upload file to storage ────────────────────────────────────────────────
@@ -137,6 +155,8 @@ export async function uploadPlaylistFile(
   return path;
 }
 
-// ── Legacy aliases ────────────────────────────────────────────────────────
+// ── Legacy aliases (keep old callers working) ─────────────────────────────
 export const saveSourcePlaylist = upsertSourcePlaylist;
-export const saveEditedPlaylist = upsertEditedPlaylist;
+/** @deprecated prefer saveNewEditedPlaylist or updateEditedPlaylist */
+export const upsertEditedPlaylist = saveNewEditedPlaylist;
+export const saveEditedPlaylist   = saveNewEditedPlaylist;
