@@ -5,7 +5,7 @@ import { Input } from "@/components/ui/input";
 import { toast } from "sonner";
 
 interface Props {
-  onLoad: (content: string, source: string) => void;
+  onLoad: (content: string, source: string, meta?: { type: "file" | "url" | "xtream"; url?: string; xtream_host?: string; xtream_user?: string }) => void;
 }
 
 type Mode = "file" | "xtream" | "url";
@@ -35,12 +35,12 @@ export const LoaderPanel = ({ onLoad }: Props) => {
       return;
     }
     const text = await file.text();
-    onLoad(text, file.name);
+    onLoad(text, file.name, { type: "file" });
     toast.success(`Loaded ${file.name}`);
   };
 
   // ── Proxy fetch — POST with Identity JWT ──────────────────────
-  const fetchViaProxy = async (body: Record<string, string>, sourceName: string) => {
+  const fetchViaProxy = async (body: Record<string, string>, sourceName: string, meta?: { type: "file" | "url" | "xtream"; url?: string; xtream_host?: string; xtream_user?: string }) => {
     setLoading(true);
     try {
       const res = await fetch("/api/m3u-proxy", {
@@ -60,7 +60,7 @@ export const LoaderPanel = ({ onLoad }: Props) => {
         return;
       }
 
-      onLoad(text, sourceName);
+      onLoad(text, sourceName, meta);
       const count = (text.match(/#EXTINF/g) || []).length;
       toast.success(`Loaded ${count.toLocaleString()} channels from ${sourceName}`);
     } catch {
@@ -85,7 +85,7 @@ export const LoaderPanel = ({ onLoad }: Props) => {
       return;
     }
 
-    await fetchViaProxy({ host, username: user, password: pass }, host.replace(/^https?:\/\//, ""));
+    await fetchViaProxy({ host, username: user, password: pass }, host.replace(/^https?:\/\//, ""), { type: "xtream", xtream_host: host, xtream_user: user });
   };
 
   // ── M3U URL submit ────────────────────────────────────────────
@@ -99,7 +99,7 @@ export const LoaderPanel = ({ onLoad }: Props) => {
       toast.error("URL must start with http:// or https://");
       return;
     }
-    await fetchViaProxy({ url }, "Remote playlist");
+    await fetchViaProxy({ url }, "Remote playlist", { type: "url", url });
   };
 
   const tabs: { id: Mode; label: string }[] = [

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Shield } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -6,31 +6,18 @@ import { supabase } from "@/lib/supabase";
 import type { Session } from "@supabase/supabase-js";
 
 interface Props {
-  children: React.ReactNode;
+  onAuth: (session: Session | null) => void;
 }
 
 type AuthView = "login" | "signup" | "forgot";
 
-export const AuthGate = ({ children }: Props) => {
-  const [session, setSession]   = useState<Session | null>(null);
-  const [loading, setLoading]   = useState(true);
+export const AuthGate = ({ onAuth: _onAuth }: Props) => {
   const [view, setView]         = useState<AuthView>("login");
   const [email, setEmail]       = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy]         = useState(false);
   const [error, setError]       = useState<string | null>(null);
   const [notice, setNotice]     = useState<string | null>(null);
-
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session);
-      setLoading(false);
-    });
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, s) => {
-      setSession(s);
-    });
-    return () => listener.subscription.unsubscribe();
-  }, []);
 
   const clearMessages = () => { setError(null); setNotice(null); };
 
@@ -39,6 +26,7 @@ export const AuthGate = ({ children }: Props) => {
     const { error: err } = await supabase.auth.signInWithPassword({ email, password });
     setBusy(false);
     if (err) setError(err.message);
+    // onAuthStateChange in App.tsx handles session update
   };
 
   const handleSignup = async () => {
@@ -62,36 +50,6 @@ export const AuthGate = ({ children }: Props) => {
     }
   };
 
-  const handleLogout = async () => { await supabase.auth.signOut(); };
-
-  if (loading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-background">
-        <div className="flex flex-col items-center gap-4">
-          <div className="h-10 w-10 rounded-full border-2 border-primary border-t-transparent animate-spin" />
-          <p className="text-xs text-muted-foreground tracking-widest uppercase">Loading…</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (session) {
-    return (
-      <>
-        <div className="fixed top-3 right-4 z-50 flex items-center gap-2">
-          <span className="text-xs text-muted-foreground hidden md:block">{session.user.email}</span>
-          <button
-            onClick={handleLogout}
-            className="text-xs text-muted-foreground hover:text-primary transition-colors px-3 py-1.5 rounded-lg border border-border/50 hover:border-primary/40 bg-background/80 backdrop-blur-sm"
-          >
-            Sign out
-          </button>
-        </div>
-        {children}
-      </>
-    );
-  }
-
   return (
     <div className="min-h-screen flex flex-col items-center justify-center bg-background px-4">
       <div className="fixed top-0 left-0 right-0 h-0.5 bg-gradient-to-r from-transparent via-primary to-transparent" />
@@ -112,7 +70,7 @@ export const AuthGate = ({ children }: Props) => {
             <Shield className="h-6 w-6 text-primary" />
           </div>
           <h2 className="font-display font-bold text-xl mb-1 text-center">
-            {view === "login" && "Sign In"}{view === "signup" && "Create Account"}{view === "forgot" && "Reset Password"}
+            {view === "login" ? "Sign In" : view === "signup" ? "Create Account" : "Reset Password"}
           </h2>
           <p className="text-sm text-muted-foreground mb-6 text-center leading-relaxed">
             {view === "login" && "Sign in with your Team 8K credentials."}
@@ -140,9 +98,9 @@ export const AuthGate = ({ children }: Props) => {
           {error  && <p className="text-xs text-red-400 mb-3 text-center">{error}</p>}
           {notice && <p className="text-xs text-green-400 mb-3 text-center">{notice}</p>}
 
-          {view === "login"  && <Button variant="gold" className="w-full" onClick={handleLogin}  disabled={busy}>{busy ? "Signing in…"        : "Sign In"}</Button>}
-          {view === "signup" && <Button variant="gold" className="w-full" onClick={handleSignup} disabled={busy}>{busy ? "Creating account…"  : "Create Account"}</Button>}
-          {view === "forgot" && <Button variant="gold" className="w-full" onClick={handleForgot} disabled={busy}>{busy ? "Sending…"           : "Send Reset Link"}</Button>}
+          {view === "login"  && <Button variant="gold" className="w-full" onClick={handleLogin}  disabled={busy}>{busy ? "Signing in…"       : "Sign In"}</Button>}
+          {view === "signup" && <Button variant="gold" className="w-full" onClick={handleSignup} disabled={busy}>{busy ? "Creating account…" : "Create Account"}</Button>}
+          {view === "forgot" && <Button variant="gold" className="w-full" onClick={handleForgot} disabled={busy}>{busy ? "Sending…"          : "Send Reset Link"}</Button>}
 
           <div className="flex justify-between mt-4 text-xs text-muted-foreground">
             {view !== "login" ? (
