@@ -8,43 +8,44 @@ import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import {
   supabase,
+  listEditedPlaylists,
+  deleteEditedPlaylist,
   type SourcePlaylistRow,
   type EditedPlaylistRow,
 } from "@/lib/supabase";
 
 export default function Dashboard() {
   const navigate = useNavigate();
-  const [source,  setSource]  = useState<SourcePlaylistRow | null>(null);
-  const [edited,  setEdited]  = useState<EditedPlaylistRow | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [source,   setSource]   = useState<SourcePlaylistRow | null>(null);
+  const [edited,   setEdited]   = useState<EditedPlaylistRow[]>([]);
+  const [loading,  setLoading]  = useState(true);
   const [resyncing, setResyncing] = useState(false);
 
   const load = async () => {
     setLoading(true);
-    const [{ data: s, error: se }, { data: e, error: ee }] = await Promise.all([
-      supabase
-        .from("source_playlists")
-        .select("*")
-        .order("updated_at", { ascending: false })
-        .limit(1)
-        .maybeSingle(),
-      supabase
-        .from("edited_playlists")
-        .select("*")
-        .order("updated_at", { ascending: false })
-        .limit(1)
-        .maybeSingle(),
-    ]);
-    if (se) toast.error("Failed to load source playlist");
-    if (ee) toast.error("Failed to load edited playlist");
-    setSource(s as SourcePlaylistRow | null);
-    setEdited(e as EditedPlaylistRow | null);
-    setLoading(false);
+    try {
+      const [{ data: s, error: se }, editedRows] = await Promise.all([
+        supabase
+          .from("source_playlists")
+          .select("*")
+          .order("updated_at", { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+        listEditedPlaylists(),
+      ]);
+      if (se) toast.error("Failed to load source playlist");
+      setSource(s as SourcePlaylistRow | null);
+      setEdited(editedRows);
+    } catch {
+      toast.error("Failed to load playlists");
+    } finally {
+      setLoading(false);
+    }
   };
 
   useEffect(() => { load(); }, []);
 
-  // ── Resync source from provider ───────────────────────────────
+  // ── Resync source ─────────────────────────────────────────────
   const handleResync = async () => {
     if (!source) return;
     if (source.source_type === "file") {
@@ -68,7 +69,6 @@ export default function Dashboard() {
       const text = await res.text();
       const count = (text.match(/#EXTINF/g) || []).length;
 
-      // Update channel count on source record
       const { error } = await supabase
         .from("source_playlists")
         .update({ channel_count: count })
@@ -96,29 +96,24 @@ export default function Dashboard() {
     toast.success("Source playlist deleted");
   };
 
-  // ── Delete edited ─────────────────────────────────────────────
-  const deleteEdited = async () => {
-    if (!edited) return;
-    if (edited.storage_path) {
-      await supabase.storage.from("edited-playlists").remove([edited.storage_path]);
+  // ── Delete one edited playlist ────────────────────────────────
+  const handleDeleteEdited = async (row: EditedPlaylistRow) => {
+    try {
+      await deleteEditedPlaylist(row);
+      setEdited(prev => prev.filter(r => r.id !== row.id));
+      toast.success(`"${row.name}" deleted`);
+    } catch (err: any) {
+      toast.error(err?.message || "Delete failed");
     }
-    const { error } = await supabase
-      .from("edited_playlists")
-      .delete()
-      .eq("id", edited.id);
-    if (error) { toast.error("Delete failed"); return; }
-    setEdited(null);
-    toast.success("Edited playlist deleted");
   };
 
-  // ── Download edited ───────────────────────────────────────────
-  const downloadEdited = async () => {
-    if (!edited) return;
-    let content = edited.content;
-    if (!content && edited.storage_path) {
+  // ── Download one edited playlist ──────────────────────────────
+  const handleDownloadEdited = async (row: EditedPlaylistRow) => {
+    let content = row.content;
+    if (!content && row.storage_path) {
       const { data, error } = await supabase.storage
         .from("edited-playlists")
-        .download(edited.storage_path);
+        .download(row.storage_path);
       if (error || !data) { toast.error("Download failed"); return; }
       content = await data.text();
     }
@@ -127,10 +122,15 @@ export default function Dashboard() {
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement("a");
     a.href     = url;
-    a.download = `${edited.name.replace(/\s+/g, "-")}.m3u`;
+    a.download = `${row.name.replace(/\s+/g, "-")}.m3u`;
     a.click();
     URL.revokeObjectURL(url);
     toast.success("Downloaded");
+  };
+
+  // ── Open edited playlist in editor ────────────────────────────
+  const handleOpenInEditor = (row: EditedPlaylistRow) => {
+    navigate(`/editor?edited=${row.id}`);
   };
 
   const sourceTypeIcon = (t: string) =>
@@ -279,79 +279,95 @@ export default function Dashboard() {
             )}
           </section>
 
-          {/* ── EDITED PLAYLIST ──────────────────────────────────── */}
+          {/* ── EDITED PLAYLISTS ─────────────────────────────────── */}
           <section>
-            <div className="flex items-center gap-3 mb-4">
-              <div className="h-8 w-8 rounded-lg bg-primary/10 border border-primary/25 flex items-center justify-center">
-                <ListMusic className="h-4 w-4 text-primary" />
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-3">
+                <div className="h-8 w-8 rounded-lg bg-primary/10 border border-primary/25 flex items-center justify-center">
+                  <ListMusic className="h-4 w-4 text-primary" />
+                </div>
+                <div>
+                  <h2 className="font-display font-bold text-base tracking-wide">
+                    My Playlists
+                  </h2>
+                  <p className="text-xs text-muted-foreground">
+                    Your saved, cleaned playlists — ready for your player
+                  </p>
+                </div>
               </div>
-              <div>
-                <h2 className="font-display font-bold text-base tracking-wide">
-                  My Playlist
-                </h2>
-                <p className="text-xs text-muted-foreground">
-                  Your saved, cleaned export — ready for your player
-                </p>
-              </div>
+              {edited.length > 0 && (
+                <span className="text-xs text-muted-foreground">
+                  {edited.length} saved
+                </span>
+              )}
             </div>
 
-            {!edited ? (
+            {edited.length === 0 ? (
               <EmptyState
                 icon={<ListMusic className="h-8 w-8 text-muted-foreground/40" />}
-                title="No saved playlist yet"
-                description="After editing a playlist in the editor, click 'Save to Dashboard' to store it here."
+                title="No saved playlists yet"
+                description='After editing a playlist in the editor, click "Save to Dashboard" to store it here.'
                 cta="Go to Editor"
                 onClick={() => navigate("/editor")}
               />
             ) : (
-              <div className="bg-gradient-card ring-gold rounded-xl p-4 flex items-center gap-4 group">
-                <div className="h-10 w-10 rounded-lg bg-primary/10 border border-primary/25 flex items-center justify-center flex-shrink-0 text-primary">
-                  <ListMusic className="h-4 w-4" />
-                </div>
+              <div className="space-y-3">
+                {edited.map(row => (
+                  <div
+                    key={row.id}
+                    className="bg-gradient-card ring-gold rounded-xl p-4 flex items-center gap-4 group"
+                  >
+                    <div className="h-10 w-10 rounded-lg bg-primary/10 border border-primary/25 flex items-center justify-center flex-shrink-0 text-primary">
+                      <ListMusic className="h-4 w-4" />
+                    </div>
 
-                <div className="flex-1 min-w-0">
-                  <p className="font-semibold text-sm text-foreground truncate">
-                    {edited.name}
-                  </p>
-                  <div className="flex items-center gap-3 mt-0.5 flex-wrap">
-                    <span className="text-xs text-primary font-semibold">
-                      {edited.enabled_count.toLocaleString()} channels enabled
-                    </span>
-                    {edited.channel_count !== edited.enabled_count && (
-                      <span className="text-xs text-muted-foreground">
-                        of {edited.channel_count.toLocaleString()} total
-                      </span>
-                    )}
-                    <span className="text-xs text-muted-foreground flex items-center gap-1">
-                      <Clock className="h-3 w-3" />
-                      Saved {fmt(edited.updated_at)}
-                    </span>
+                    <div className="flex-1 min-w-0">
+                      <p className="font-semibold text-sm text-foreground truncate">
+                        {row.name}
+                      </p>
+                      <div className="flex items-center gap-3 mt-0.5 flex-wrap">
+                        <span className="text-xs text-primary font-semibold">
+                          {row.enabled_count.toLocaleString()} channels enabled
+                        </span>
+                        {row.channel_count !== row.enabled_count && (
+                          <span className="text-xs text-muted-foreground">
+                            of {row.channel_count.toLocaleString()} total
+                          </span>
+                        )}
+                        <span className="text-xs text-muted-foreground flex items-center gap-1">
+                          <Clock className="h-3 w-3" />
+                          Saved {fmt(row.updated_at)}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                      {/* Open in Editor — re-upload / continue editing */}
+                      <button
+                        onClick={() => handleOpenInEditor(row)}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-primary/30 text-primary hover:bg-primary/10 transition-all"
+                        title="Open in Editor to continue editing"
+                      >
+                        <Edit3 className="h-3.5 w-3.5" />
+                        Open in Editor
+                      </button>
+                      <button
+                        onClick={() => handleDownloadEdited(row)}
+                        className="p-2 rounded-lg hover:bg-primary/10 text-muted-foreground hover:text-primary transition-all"
+                        title="Download M3U"
+                      >
+                        <Download className="h-4 w-4" />
+                      </button>
+                      <button
+                        onClick={() => handleDeleteEdited(row)}
+                        className="p-2 rounded-lg hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-all"
+                        title="Delete"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </div>
                   </div>
-                </div>
-
-                <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <button
-                    onClick={downloadEdited}
-                    className="p-2 rounded-lg hover:bg-primary/10 text-muted-foreground hover:text-primary transition-all"
-                    title="Download M3U"
-                  >
-                    <Download className="h-4 w-4" />
-                  </button>
-                  <button
-                    onClick={() => navigate("/editor")}
-                    className="p-2 rounded-lg hover:bg-primary/10 text-muted-foreground hover:text-primary transition-all"
-                    title="Edit again"
-                  >
-                    <Edit3 className="h-4 w-4" />
-                  </button>
-                  <button
-                    onClick={deleteEdited}
-                    className="p-2 rounded-lg hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-all"
-                    title="Delete"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </button>
-                </div>
+                ))}
               </div>
             )}
           </section>
