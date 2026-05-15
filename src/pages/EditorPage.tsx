@@ -3,12 +3,16 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   Search, Trash2, Download, Copy, RotateCcw, Tv,
   ToggleLeft, Link as LinkIcon, Save, ChevronLeft, RefreshCw,
+  Replace, X, CheckSquare,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
+} from "@/components/ui/dialog";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { toast } from "sonner";
 import { LoaderPanel } from "@/components/LoaderPanel";
@@ -19,27 +23,77 @@ import {
 } from "@/lib/m3u";
 import {
   supabase,
-  upsertSourcePlaylist,
-  upsertEditedPlaylist,
+  saveNewEditedPlaylist,
+  updateEditedPlaylist,
   uploadPlaylistFile,
+  upsertSourcePlaylist,
   type SourcePlaylistRow,
+  type EditedPlaylistRow,
 } from "@/lib/supabase";
 
 export default function EditorPage() {
   const navigate     = useNavigate();
   const [params]     = useSearchParams();
   const sourceId     = params.get("source");
+  const editedId     = params.get("edited"); // load from saved edited playlist
 
-  const [channels,   setChannels]   = useState<Channel[]>([]);
-  const [source,     setSource]     = useState<string>("");
-  const [sourceRow,  setSourceRow]  = useState<SourcePlaylistRow | null>(null);
-  const [search,     setSearch]     = useState("");
-  const [catFilter,  setCatFilter]  = useState<string>("all");
-  const [dupes,      setDupes]      = useState(0);
-  const [saving,     setSaving]     = useState(false);
-  const [resyncing,  setResyncing]  = useState(false);
+  const [channels,        setChannels]        = useState<Channel[]>([]);
+  const [source,          setSource]          = useState<string>("");
+  const [sourceRow,       setSourceRow]       = useState<SourcePlaylistRow | null>(null);
+  const [editedRow,       setEditedRow]       = useState<EditedPlaylistRow | null>(null);
+  const [search,          setSearch]          = useState("");
+  const [catFilter,       setCatFilter]       = useState<string>("all");
+  const [dupes,           setDupes]           = useState(0);
+  const [saving,          setSaving]          = useState(false);
+  const [resyncing,       setResyncing]       = useState(false);
 
-  // ── Load from dashboard sourceId ─────────────────────────────
+  // ── Bulk selection ────────────────────────────────────────────
+  const [selectedIds,     setSelectedIds]     = useState<Set<string>>(new Set());
+
+  // ── Find & Replace ────────────────────────────────────────────
+  const [showFindReplace, setShowFindReplace] = useState(false);
+  const [findText,        setFindText]        = useState("");
+  const [replaceText,     setReplaceText]     = useState("");
+  const [useRegex,        setUseRegex]        = useState(false);
+  const [replaceCount,    setReplaceCount]    = useState<number | null>(null);
+
+  // ── Save dialog ───────────────────────────────────────────────
+  const [showSaveDialog,  setShowSaveDialog]  = useState(false);
+  const [playlistName,    setPlaylistName]    = useState("");
+
+  // ── Load from saved edited playlist (dashboard → editor) ──────
+  useEffect(() => {
+    if (!editedId) return;
+    (async () => {
+      const { data, error } = await supabase
+        .from("edited_playlists")
+        .select("*")
+        .eq("id", editedId)
+        .single();
+      if (error || !data) { toast.error("Could not load saved playlist"); return; }
+      const row = data as EditedPlaylistRow;
+      setEditedRow(row);
+
+      let content = row.content;
+      if (!content && row.storage_path) {
+        const { data: file, error: fe } = await supabase.storage
+          .from("edited-playlists")
+          .download(row.storage_path);
+        if (fe || !file) { toast.error("Could not download playlist file"); return; }
+        content = await file.text();
+      }
+      if (!content) { toast.error("Playlist has no content"); return; }
+
+      const parsed = parseM3U(content);
+      if (!parsed.length) { toast.error("No channels found in saved playlist"); return; }
+      setChannels(parsed);
+      setSource(row.name);
+      setPlaylistName(row.name);
+      toast.success(`Loaded "${row.name}" — ${parsed.length.toLocaleString()} channels`);
+    })();
+  }, [editedId]);
+
+  // ── Load from source playlist (dashboard → editor) ────────────
   useEffect(() => {
     if (!sourceId) return;
     (async () => {
@@ -61,19 +115,6 @@ export default function EditorPage() {
         if (!res.ok) { toast.error("Could not re-fetch playlist URL"); return; }
         const text = await res.text();
         handleLoad(text, row.name, row);
-      } else if (row.source_type === "xtream" && row.xtream_host && row.xtream_user) {
-        toast.info(
-          "Xtream playlist loaded from your saved source. Use Resync to re-fetch live data.",
-          { duration: 5000 }
-        );
-        if (row.storage_path) {
-          const { data: file, error: fe } = await supabase.storage
-            .from("source-playlists")
-            .download(row.storage_path);
-          if (fe || !file) { toast.error("Could not download saved playlist file"); return; }
-          const text = await file.text();
-          handleLoad(text, row.name, row);
-        }
       } else if (row.storage_path) {
         const { data: file, error: fe } = await supabase.storage
           .from("source-playlists")
@@ -105,9 +146,10 @@ export default function EditorPage() {
     setSearch("");
     setCatFilter("all");
     setDupes(0);
+    setSelectedIds(new Set());
+    setEditedRow(null);
 
     if (!existingRow) {
-      // Auto-save source playlist (upsert — replaces previous source)
       try {
         const row = await upsertSourcePlaylist({
           name: src,
@@ -130,26 +172,18 @@ export default function EditorPage() {
   const onLoadFromPanel = useCallback((
     content: string,
     src: string,
-    meta?: {
-      type: "file" | "url" | "xtream";
-      url?: string;
-      xtream_host?: string;
-      xtream_user?: string;
-    }
+    meta?: { type: "file" | "url" | "xtream"; url?: string; xtream_host?: string; xtream_user?: string; }
   ) => {
     handleLoad(content, src, null, meta);
   }, [handleLoad]);
 
-  // ── Resync source from provider ───────────────────────────────
+  // ── Resync ────────────────────────────────────────────────────
   const handleResync = async () => {
     if (!sourceRow) return;
-    if (sourceRow.source_type === "file") return; // can't resync a file
-
+    if (sourceRow.source_type === "file") return;
     setResyncing(true);
     try {
       let content = "";
-      let sourceName = sourceRow.name;
-
       if (sourceRow.source_type === "url" && sourceRow.url) {
         const res = await fetch("/api/m3u-proxy", {
           method: "POST",
@@ -158,25 +192,16 @@ export default function EditorPage() {
         });
         if (!res.ok) { toast.error("Could not re-fetch playlist URL"); return; }
         content = await res.text();
-      } else if (sourceRow.source_type === "xtream" && sourceRow.xtream_host && sourceRow.xtream_user) {
-        toast.error(
-          "Xtream resync requires your provider password. Please reload via the loader panel."
-        );
+      } else {
+        toast.error("Xtream resync requires your provider password. Please reload via the loader panel.");
         return;
       }
-
       const parsed = parseM3U(content);
       if (!parsed.length) { toast.error("No channels found after resync"); return; }
-
       setChannels(parsed);
-      setSource(sourceName);
-      setSearch("");
-      setCatFilter("all");
-      setDupes(0);
-
-      // Update source record with new channel count
+      setSelectedIds(new Set());
       const updated = await upsertSourcePlaylist({
-        name: sourceName,
+        name: sourceRow.name,
         source_type: sourceRow.source_type,
         url: sourceRow.url ?? null,
         xtream_host: sourceRow.xtream_host ?? null,
@@ -192,33 +217,61 @@ export default function EditorPage() {
     }
   };
 
-  // ── Save edited playlist to Supabase (upsert) ─────────────────
-  const handleSaveToDashboard = async () => {
+  // ── Save to dashboard (named, with dialog) ────────────────────
+  const openSaveDialog = () => {
     if (!channels.length) return;
-    setSaving(true);
-    try {
-      const enabled  = channels.filter(c => c.enabled);
-      const m3uText  = exportM3U(channels);
-      const name     = source || "My Playlist";
-      const filename = `edited-${Date.now()}.m3u`;
+    // Pre-fill name: use existing edited name, or source name
+    if (!playlistName) setPlaylistName(source || "My Playlist");
+    setShowSaveDialog(true);
+  };
 
+  const handleSaveToDashboard = async () => {
+    if (!channels.length || !playlistName.trim()) return;
+    setSaving(true);
+    setShowSaveDialog(false);
+    try {
+      const enabled   = channels.filter(c => c.enabled);
+      const m3uText   = exportM3U(channels);
+      const name      = playlistName.trim();
+
+      // Store inline (no storage cost for edited playlists)
+      // If content is very large (>1MB), fall back to storage
       let storagePath: string | undefined;
-      try {
-        storagePath = await uploadPlaylistFile("edited-playlists", filename, m3uText);
-      } catch {
-        // Storage optional — fall back to inline if small enough
+      let inlineContent: string | null = m3uText;
+      if (m3uText.length > 900_000) {
+        try {
+          const filename = `edited-${Date.now()}.m3u`;
+          storagePath    = await uploadPlaylistFile("edited-playlists", filename, m3uText);
+          inlineContent  = null;
+        } catch {
+          // keep inline if storage fails
+        }
       }
 
-      await upsertEditedPlaylist({
-        source_playlist_id: sourceRow?.id ?? null,
-        name,
-        content: !storagePath ? m3uText : null,
-        storage_path: storagePath ?? null,
-        channel_count: channels.length,
-        enabled_count: enabled.length,
-      });
-
-      toast.success("Playlist saved to dashboard!");
+      if (editedRow) {
+        // Overwrite the existing saved playlist we loaded from
+        await updateEditedPlaylist(editedRow.id, {
+          name,
+          content:       inlineContent,
+          storage_path:  storagePath ?? editedRow.storage_path ?? null,
+          channel_count: channels.length,
+          enabled_count: enabled.length,
+          source_playlist_id: sourceRow?.id ?? editedRow.source_playlist_id ?? null,
+        });
+        toast.success(`"${name}" updated!`);
+      } else {
+        // Create a new playlist
+        const newRow = await saveNewEditedPlaylist({
+          source_playlist_id: sourceRow?.id ?? null,
+          name,
+          content:       inlineContent,
+          storage_path:  storagePath ?? null,
+          channel_count: channels.length,
+          enabled_count: enabled.length,
+        });
+        setEditedRow(newRow);
+        toast.success(`"${name}" saved to dashboard!`);
+      }
     } catch (err: any) {
       toast.error(err?.message || "Save failed");
     } finally {
@@ -226,9 +279,82 @@ export default function EditorPage() {
     }
   };
 
+  // ── Find & Replace ────────────────────────────────────────────
+  const handleFindReplace = () => {
+    if (!findText.trim()) { toast.error("Enter something to find"); return; }
+    let count = 0;
+    setChannels(prev => prev.map(ch => {
+      let newName = ch.name;
+      try {
+        if (useRegex) {
+          const re = new RegExp(findText, "gi");
+          if (re.test(ch.name)) {
+            newName = ch.name.replace(new RegExp(findText, "gi"), replaceText);
+            count++;
+          }
+        } else {
+          const lower = ch.name.toLowerCase();
+          const findLower = findText.toLowerCase();
+          if (lower.includes(findLower)) {
+            newName = ch.name.replace(new RegExp(findText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), replaceText);
+            count++;
+          }
+        }
+      } catch { /* invalid regex — skip */ }
+      return newName !== ch.name ? { ...ch, name: newName } : ch;
+    }));
+    setReplaceCount(count);
+    if (count === 0) toast.info("No matches found");
+    else toast.success(`Replaced ${count} channel name${count > 1 ? "s" : ""}`);
+  };
+
+  // ── Bulk selection helpers ────────────────────────────────────
+  const handleSelectChange = (id: string, selected: boolean) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      selected ? next.add(id) : next.delete(id);
+      return next;
+    });
+  };
+
+  const handleSelectAllInCategory = (category: string, selected: boolean) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      channels.filter(c => c.category === category).forEach(c =>
+        selected ? next.add(c.id) : next.delete(c.id)
+      );
+      return next;
+    });
+  };
+
+  const handleDeleteSelected = (ids: string[]) => {
+    const idSet = new Set(ids);
+    setChannels(prev => prev.filter(c => !idSet.has(c.id)));
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      ids.forEach(id => next.delete(id));
+      return next;
+    });
+    toast.success(`Deleted ${ids.length} channel${ids.length > 1 ? "s" : ""}`);
+  };
+
+  const clearSelection = () => setSelectedIds(new Set());
+
+  // ── Category rename ───────────────────────────────────────────
+  const handleRenameCategory = (oldName: string, newName: string) => {
+    setChannels(prev => prev.map(c =>
+      c.category === oldName
+        ? { ...c, category: newName, attributes: { ...c.attributes, "group-title": newName } }
+        : c
+    ));
+    toast.success(`Category renamed to "${newName}"`);
+  };
+
+  // ── Derived state ─────────────────────────────────────────────
   const categories   = useMemo(() =>
     Array.from(new Set(channels.map(c => c.category))).sort(), [channels]);
-  const filtered     = useMemo(() => {
+
+  const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     return channels.filter(c => {
       if (catFilter !== "all" && c.category !== catFilter) return false;
@@ -236,8 +362,9 @@ export default function EditorPage() {
       return c.name.toLowerCase().includes(q) || c.category.toLowerCase().includes(q);
     });
   }, [channels, search, catFilter]);
-  const grouped      = useMemo(() => groupByCategory(filtered), [filtered]);
-  const groupKeys    = useMemo(() => Object.keys(grouped).sort(), [grouped]);
+
+  const grouped   = useMemo(() => groupByCategory(filtered), [filtered]);
+  const groupKeys = useMemo(() => Object.keys(grouped).sort(), [grouped]);
   const enabledCount = channels.filter(c => c.enabled).length;
 
   const updateChannel = (id: string, patch: Partial<Channel>) =>
@@ -247,10 +374,9 @@ export default function EditorPage() {
     const { channels: cleaned, removed } = dedupeByUrl(channels);
     setChannels(cleaned);
     setDupes(p => p + removed);
-    toast.success(
-      removed > 0
-        ? `Removed ${removed} duplicate${removed > 1 ? "s" : ""}`
-        : "No duplicates found"
+    toast.success(removed > 0
+      ? `Removed ${removed} duplicate${removed > 1 ? "s" : ""}`
+      : "No duplicates found"
     );
   };
 
@@ -262,6 +388,7 @@ export default function EditorPage() {
   const handleReset = () => {
     setChannels([]); setSource(""); setSearch("");
     setCatFilter("all"); setDupes(0); setSourceRow(null);
+    setEditedRow(null); setSelectedIds(new Set()); setPlaylistName("");
   };
 
   const handleDownload = () => {
@@ -269,7 +396,7 @@ export default function EditorPage() {
     const blob = new Blob([text], { type: "audio/x-mpegurl" });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement("a");
-    a.href = url; a.download = "team8k-playlist.m3u"; a.click();
+    a.href = url; a.download = `${(playlistName || "team8k-playlist").replace(/\s+/g, "-")}.m3u`; a.click();
     URL.revokeObjectURL(url);
     toast.success("Playlist downloaded");
   };
@@ -292,6 +419,7 @@ export default function EditorPage() {
   };
 
   const canResync = sourceRow && sourceRow.source_type !== "file";
+  const totalSelected = selectedIds.size;
 
   return (
     <div className="min-h-screen">
@@ -307,10 +435,7 @@ export default function EditorPage() {
       </div>
 
       <SidebarProvider style={{ minHeight: "unset" }}>
-        <div
-          className="flex w-full pb-16 relative overflow-x-hidden"
-          style={{ minHeight: "unset" }}
-        >
+        <div className="flex w-full pb-16 relative overflow-x-hidden" style={{ minHeight: "unset" }}>
           {channels.length > 0 && (
             <SummarySidebar
               total={channels.length}
@@ -342,17 +467,16 @@ export default function EditorPage() {
                       Load Your Playlist
                     </h2>
                     <p className="text-muted-foreground text-sm">
-                      Everything runs in your browser — your source is saved to
-                      your dashboard automatically.
+                      Everything runs in your browser — your source is saved to your dashboard automatically.
                     </p>
                   </div>
                   <LoaderPanel onLoad={onLoadFromPanel} />
                   <div className="mt-10 max-w-3xl mx-auto grid grid-cols-2 md:grid-cols-4 gap-3">
                     {[
-                      { t: "Edit & Rename",  d: "Rename any channel" },
+                      { t: "Edit & Rename",  d: "Rename channels & categories" },
                       { t: "Smart Dedupe",   d: "Strip duplicate URLs" },
-                      { t: "Group & Filter", d: "Auto-group by category" },
-                      { t: "Save & Export",  d: "Store to your dashboard" },
+                      { t: "Bulk Edit",      d: "Select, delete, find & replace" },
+                      { t: "Save & Export",  d: "Named saves to your dashboard" },
                     ].map(f => (
                       <div key={f.t} className="bg-gradient-card ring-gold rounded-xl p-5 text-center">
                         <h4 className="font-display font-bold text-sm mb-1">{f.t}</h4>
@@ -372,6 +496,9 @@ export default function EditorPage() {
                       <div>
                         <p className="text-xs text-muted-foreground truncate max-w-[280px]">
                           {source}
+                          {editedRow && (
+                            <span className="ml-2 text-primary/70">· editing saved playlist</span>
+                          )}
                         </p>
                         <p className="font-display font-bold text-lg">
                           <span className="text-gradient-gold">{enabledCount}</span>
@@ -384,13 +511,7 @@ export default function EditorPage() {
                     </div>
                     <div className="flex gap-2 flex-wrap">
                       {canResync && (
-                        <Button
-                          variant="goldOutline"
-                          size="sm"
-                          onClick={handleResync}
-                          disabled={resyncing}
-                          title="Re-fetch latest channels from your provider"
-                        >
+                        <Button variant="goldOutline" size="sm" onClick={handleResync} disabled={resyncing} title="Re-fetch latest channels from your provider">
                           <RefreshCw className={`h-4 w-4 ${resyncing ? "animate-spin" : ""}`} />
                           {resyncing ? "Syncing…" : "Resync"}
                         </Button>
@@ -404,11 +525,84 @@ export default function EditorPage() {
                       <Button variant="goldOutline" size="sm" onClick={handleDedupe}>
                         <Trash2 className="h-4 w-4" /> Dedupe
                       </Button>
+                      <Button variant="goldOutline" size="sm" onClick={() => setShowFindReplace(v => !v)}>
+                        <Replace className="h-4 w-4" /> Find &amp; Replace
+                      </Button>
                       <Button variant="goldOutline" size="sm" onClick={handleReset}>
                         <RotateCcw className="h-4 w-4" /> Reset
                       </Button>
                     </div>
                   </div>
+
+                  {/* Find & Replace panel */}
+                  {showFindReplace && (
+                    <div className="bg-gradient-card ring-gold rounded-2xl p-5 shadow-elegant space-y-3">
+                      <div className="flex items-center justify-between mb-1">
+                        <h3 className="font-display font-bold text-sm text-primary uppercase tracking-widest">
+                          Find &amp; Replace Channel Names
+                        </h3>
+                        <button onClick={() => { setShowFindReplace(false); setReplaceCount(null); }} className="text-muted-foreground hover:text-foreground">
+                          <X className="h-4 w-4" />
+                        </button>
+                      </div>
+                      <div className="grid md:grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-xs text-muted-foreground uppercase tracking-widest mb-1.5">Find</label>
+                          <Input
+                            placeholder="Text to find…"
+                            value={findText}
+                            onChange={e => { setFindText(e.target.value); setReplaceCount(null); }}
+                            className="bg-background/60 border-border focus-visible:ring-primary"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs text-muted-foreground uppercase tracking-widest mb-1.5">Replace with</label>
+                          <Input
+                            placeholder="Replacement text…"
+                            value={replaceText}
+                            onChange={e => { setReplaceText(e.target.value); setReplaceCount(null); }}
+                            className="bg-background/60 border-border focus-visible:ring-primary"
+                            onKeyDown={e => e.key === "Enter" && handleFindReplace()}
+                          />
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-4">
+                        <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={useRegex}
+                            onChange={e => setUseRegex(e.target.checked)}
+                            className="h-3.5 w-3.5 accent-primary"
+                          />
+                          Use regex
+                        </label>
+                        {replaceCount !== null && replaceCount > 0 && (
+                          <span className="text-xs text-primary">{replaceCount} replaced</span>
+                        )}
+                        <Button variant="gold" size="sm" onClick={handleFindReplace} className="ml-auto">
+                          <Replace className="h-4 w-4" /> Replace All
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Bulk selection bar */}
+                  {totalSelected > 0 && (
+                    <div className="bg-gradient-card ring-gold rounded-2xl px-5 py-3 flex items-center gap-4 shadow-elegant">
+                      <CheckSquare className="h-4 w-4 text-primary" />
+                      <span className="text-sm font-medium text-primary">
+                        {totalSelected} channel{totalSelected > 1 ? "s" : ""} selected
+                      </span>
+                      <div className="flex gap-2 ml-auto">
+                        <Button variant="goldOutline" size="sm" onClick={() => handleDeleteSelected(Array.from(selectedIds))}>
+                          <Trash2 className="h-4 w-4" /> Delete selected
+                        </Button>
+                        <Button variant="goldOutline" size="sm" onClick={clearSelection}>
+                          <X className="h-4 w-4" /> Clear
+                        </Button>
+                      </div>
+                    </div>
+                  )}
 
                   {/* Filters */}
                   <div className="bg-gradient-card ring-gold rounded-2xl p-4 md:p-5 flex flex-col md:flex-row gap-3">
@@ -447,9 +641,14 @@ export default function EditorPage() {
                           category={cat}
                           channels={grouped[cat]}
                           defaultOpen={groupKeys.length <= 3 || !!search}
+                          selectedIds={selectedIds}
                           onToggle={(id, enabled) => updateChannel(id, { enabled })}
                           onRename={(id, name) => updateChannel(id, { name })}
+                          onRenameCategory={handleRenameCategory}
                           onToggleAll={handleToggleCat}
+                          onSelectChange={handleSelectChange}
+                          onSelectAllInCategory={handleSelectAllInCategory}
+                          onDeleteSelected={handleDeleteSelected}
                         />
                       ))
                     )}
@@ -473,13 +672,9 @@ export default function EditorPage() {
                         <Button variant="goldOutline" onClick={handleDownload}>
                           <Download className="h-4 w-4" /> Download
                         </Button>
-                        <Button
-                          variant="gold"
-                          onClick={handleSaveToDashboard}
-                          disabled={saving}
-                        >
+                        <Button variant="gold" onClick={openSaveDialog} disabled={saving}>
                           <Save className="h-4 w-4" />
-                          {saving ? "Saving…" : "Save to Dashboard"}
+                          {saving ? "Saving…" : editedRow ? "Update Playlist" : "Save to Dashboard"}
                         </Button>
                       </div>
                     </div>
@@ -490,6 +685,44 @@ export default function EditorPage() {
           </div>
         </div>
       </SidebarProvider>
+
+      {/* ── Save / name dialog ──────────────────────────────────── */}
+      <Dialog open={showSaveDialog} onOpenChange={setShowSaveDialog}>
+        <DialogContent className="bg-gradient-card border-border">
+          <DialogHeader>
+            <DialogTitle className="font-display font-bold text-lg">
+              {editedRow ? "Update Playlist" : "Save Playlist"}
+            </DialogTitle>
+          </DialogHeader>
+          <div className="py-2 space-y-3">
+            <label className="block text-xs text-muted-foreground uppercase tracking-widest mb-1.5">
+              Playlist name
+            </label>
+            <Input
+              autoFocus
+              placeholder="e.g. Sports Channels, My IPTV…"
+              value={playlistName}
+              onChange={e => setPlaylistName(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && handleSaveToDashboard()}
+              className="bg-background/60 border-border focus-visible:ring-primary"
+            />
+            <p className="text-xs text-muted-foreground">
+              {editedRow
+                ? `This will overwrite "${editedRow.name}" in your dashboard.`
+                : `${enabledCount} of ${channels.length} channels will be saved.`}
+            </p>
+          </div>
+          <DialogFooter className="gap-2">
+            <Button variant="goldOutline" onClick={() => setShowSaveDialog(false)}>
+              Cancel
+            </Button>
+            <Button variant="gold" onClick={handleSaveToDashboard} disabled={!playlistName.trim()}>
+              <Save className="h-4 w-4" />
+              {editedRow ? "Update" : "Save"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
