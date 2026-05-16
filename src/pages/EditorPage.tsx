@@ -21,6 +21,7 @@ import { LoaderPanel } from "@/components/LoaderPanel";
 import { CategoryGroup } from "@/components/CategoryGroup";
 import { SummarySidebar } from "@/components/SummarySidebar";
 import { AddFromSourceModal } from "@/components/AddFromSourceModal";
+import { BulkRenameModal } from "@/components/BulkRenameModal";
 import { useHistory } from "@/hooks/useHistory";
 import {
   Channel, parseM3U, exportM3U, dedupeByUrl, groupByCategory,
@@ -57,12 +58,8 @@ export default function EditorPage() {
   // ── Bulk selection ────────────────────────────────────────────
   const [selectedIds,     setSelectedIds]     = useState<Set<string>>(new Set());
 
-  // ── Find & Replace ────────────────────────────────────────────
-  const [showFindReplace, setShowFindReplace] = useState(false);
-  const [findText,        setFindText]        = useState("");
-  const [replaceText,     setReplaceText]     = useState("");
-  const [useRegex,        setUseRegex]        = useState(false);
-  const [replaceCount,    setReplaceCount]    = useState<number | null>(null);
+  // ── Bulk Rename modal ────────────────────────────────────────
+  const [showBulkRename,  setShowBulkRename]  = useState(false);
 
   // ── Save dialog ───────────────────────────────────────────────
   const [showSaveDialog,  setShowSaveDialog]  = useState(false);
@@ -307,28 +304,10 @@ export default function EditorPage() {
     }
   };
 
-  // ── Find & Replace ────────────────────────────────────────────
-  const handleFindReplace = () => {
-    if (!findText.trim()) { toast.error("Enter something to find"); return; }
-    let count = 0;
-    setChannels(prev => prev.map(ch => {
-      let newName = ch.name;
-      try {
-        if (useRegex) {
-          const re = new RegExp(findText, "gi");
-          if (re.test(ch.name)) { newName = ch.name.replace(new RegExp(findText, "gi"), replaceText); count++; }
-        } else {
-          if (ch.name.toLowerCase().includes(findText.toLowerCase())) {
-            newName = ch.name.replace(new RegExp(findText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), replaceText);
-            count++;
-          }
-        }
-      } catch { /* invalid regex */ }
-      return newName !== ch.name ? { ...ch, name: newName } : ch;
-    }));
-    setReplaceCount(count);
-    if (count === 0) toast.info("No matches found");
-    else toast.success(`Replaced ${count} channel name${count > 1 ? "s" : ""}`);
+  // ── Bulk Rename apply ─────────────────────────────────────────
+  const handleBulkRenameApply = (updated: Channel[], count: number) => {
+    setChannels(updated);
+    toast.success(`Renamed ${count} channel${count !== 1 ? "s" : ""}`);
   };
 
   // ── Bulk selection ────────────────────────────────────────────
@@ -564,8 +543,8 @@ export default function EditorPage() {
                       <Button variant="goldOutline" size="sm" onClick={handleDedupe}>
                         <Trash2 className="h-4 w-4" /> Dedupe
                       </Button>
-                      <Button variant="goldOutline" size="sm" onClick={() => setShowFindReplace(v => !v)}>
-                        <Replace className="h-4 w-4" /> Find &amp; Replace
+                      <Button variant="goldOutline" size="sm" onClick={() => setShowBulkRename(true)}>
+                        <Replace className="h-4 w-4" /> Bulk Rename
                       </Button>
                       <Button variant="goldOutline" size="sm" onClick={handleReset}>
                         <RotateCcw className="h-4 w-4" /> Reset
@@ -573,52 +552,7 @@ export default function EditorPage() {
                     </div>
                   </div>
 
-                  {/* Find & Replace panel */}
-                  {showFindReplace && (
-                    <div className="bg-gradient-card ring-gold rounded-2xl p-5 shadow-elegant space-y-3">
-                      <div className="flex items-center justify-between mb-1">
-                        <h3 className="font-display font-bold text-sm text-primary uppercase tracking-widest">
-                          Find &amp; Replace Channel Names
-                        </h3>
-                        <button onClick={() => { setShowFindReplace(false); setReplaceCount(null); }} className="text-muted-foreground hover:text-foreground">
-                          <X className="h-4 w-4" />
-                        </button>
-                      </div>
-                      <div className="grid md:grid-cols-2 gap-3">
-                        <div>
-                          <label className="block text-xs text-muted-foreground uppercase tracking-widest mb-1.5">Find</label>
-                          <Input
-                            placeholder="Text to find…"
-                            value={findText}
-                            onChange={e => { setFindText(e.target.value); setReplaceCount(null); }}
-                            className="bg-background/60 border-border focus-visible:ring-primary"
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-xs text-muted-foreground uppercase tracking-widest mb-1.5">Replace with</label>
-                          <Input
-                            placeholder="Replacement text…"
-                            value={replaceText}
-                            onChange={e => { setReplaceText(e.target.value); setReplaceCount(null); }}
-                            className="bg-background/60 border-border focus-visible:ring-primary"
-                            onKeyDown={e => e.key === "Enter" && handleFindReplace()}
-                          />
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-4">
-                        <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer select-none">
-                          <input type="checkbox" checked={useRegex} onChange={e => setUseRegex(e.target.checked)} className="h-3.5 w-3.5 accent-primary" />
-                          Use regex
-                        </label>
-                        {replaceCount !== null && replaceCount > 0 && (
-                          <span className="text-xs text-primary">{replaceCount} replaced</span>
-                        )}
-                        <Button variant="gold" size="sm" onClick={handleFindReplace} className="ml-auto">
-                          <Replace className="h-4 w-4" /> Replace All
-                        </Button>
-                      </div>
-                    </div>
-                  )}
+
 
                   {/* Bulk selection bar */}
                   {totalSelected > 0 && (
@@ -773,6 +707,14 @@ export default function EditorPage() {
         sourcePlaylistId={sourceRow?.id ?? editedRow?.source_playlist_id ?? null}
         existingUrls={existingUrls}
         onAdd={handleAddFromSource}
+      />
+
+      {/* Bulk Rename modal */}
+      <BulkRenameModal
+        open={showBulkRename}
+        onClose={() => setShowBulkRename(false)}
+        channels={channels}
+        onApply={handleBulkRenameApply}
       />
     </div>
   );
