@@ -2,6 +2,7 @@ import { useEffect, useMemo, useCallback, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   Search, Trash2, Download, Copy, RotateCcw, Tv,
+  Share2,
   ToggleLeft, Link as LinkIcon, Save, ChevronLeft, RefreshCw,
   Replace, X, CheckSquare, Undo2, Redo2, Plus,
 } from "lucide-react";
@@ -30,6 +31,7 @@ import {
   updateEditedPlaylist,
   uploadPlaylistFile,
   upsertSourcePlaylist,
+  getOrCreateSharedUrl,
   type SourcePlaylistRow,
   type EditedPlaylistRow,
 } from "@/lib/supabase";
@@ -421,18 +423,29 @@ export default function EditorPage() {
     catch { toast.error("Clipboard unavailable"); }
   };
 
+  const [generatingUrl, setGeneratingUrl] = useState(false);
+
   const handleGetUrl = async () => {
+    if (!editedRow) {
+      toast.error("Save your playlist to the dashboard first, then you can get a shareable URL.");
+      return;
+    }
+    setGeneratingUrl(true);
     try {
-      const text    = exportM3U(channels.filter(c => c.enabled));
-      const encoded = btoa(unescape(encodeURIComponent(text)));
-      const url     = `${window.location.origin}${window.location.pathname}#playlist=${encoded}`;
+      const base = window.location.origin;
+      const url  = await getOrCreateSharedUrl(editedRow.id, base);
       await navigator.clipboard.writeText(url);
-      toast.success(`URL copied — ${enabledCount} channels`);
-    } catch { toast.error("Could not generate URL"); }
+      toast.success("Playlist URL copied — paste it directly into TiviMate or any M3U player!", {
+        duration: 5000,
+      });
+    } catch (err: any) {
+      toast.error(err?.message || "Could not generate URL");
+    } finally {
+      setGeneratingUrl(false);
+    }
   };
 
   const canResync     = sourceRow && sourceRow.source_type !== "file";
-  const canAddSource  = !!sourceRow;
   const totalSelected = selectedIds.size;
 
   return (
@@ -539,17 +552,6 @@ export default function EditorPage() {
                         <Button variant="goldOutline" size="sm" onClick={handleResync} disabled={resyncing}>
                           <RefreshCw className={`h-4 w-4 ${resyncing ? "animate-spin" : ""}`} />
                           {resyncing ? "Syncing…" : "Resync"}
-                        </Button>
-                      )}
-
-                      {/* Add from source */}
-                      {canAddSource && (
-                        <Button
-                          variant="goldOutline" size="sm"
-                          onClick={() => setShowAddSource(true)}
-                          title="Browse your source playlist and add channels"
-                        >
-                          <Plus className="h-4 w-4" /> Add Channels
                         </Button>
                       )}
 
@@ -696,15 +698,26 @@ export default function EditorPage() {
                         <span className="text-muted-foreground"> channels</span>
                       </p>
                       <div className="flex gap-2 flex-wrap">
-                        <Button variant="goldOutline" onClick={handleCopy}>
-                          <Copy className="h-4 w-4" /> Copy
-                        </Button>
-                        <Button variant="goldOutline" onClick={handleGetUrl}>
-                          <LinkIcon className="h-4 w-4" /> Get URL
-                        </Button>
-                        <Button variant="goldOutline" onClick={handleDownload}>
-                          <Download className="h-4 w-4" /> Download
-                        </Button>
+                        {/* Copy, Download and Get URL only available for edited (not raw source) playlists */}
+                        {editedRow && (
+                          <>
+                            <Button variant="goldOutline" onClick={handleCopy}>
+                              <Copy className="h-4 w-4" /> Copy
+                            </Button>
+                            <Button variant="goldOutline" onClick={handleDownload}>
+                              <Download className="h-4 w-4" /> Download
+                            </Button>
+                            <Button
+                              variant="goldOutline"
+                              onClick={handleGetUrl}
+                              disabled={generatingUrl}
+                              title="Get a short URL to use directly in TiviMate or any M3U player"
+                            >
+                              <Share2 className="h-4 w-4" />
+                              {generatingUrl ? "Generating…" : "Get Player URL"}
+                            </Button>
+                          </>
+                        )}
                         <Button variant="gold" onClick={openSaveDialog} disabled={saving}>
                           <Save className="h-4 w-4" />
                           {saving ? "Saving…" : editedRow ? "Update Playlist" : "Save to Dashboard"}
