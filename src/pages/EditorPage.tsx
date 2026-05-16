@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useCallback, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   Search, Trash2, Download, Copy, RotateCcw, Tv,
   ToggleLeft, Link as LinkIcon, Save, ChevronLeft, RefreshCw,
-  Replace, X, CheckSquare,
+  Replace, X, CheckSquare, Undo2, Redo2, Plus,
 } from "lucide-react";
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -18,6 +19,8 @@ import { toast } from "sonner";
 import { LoaderPanel } from "@/components/LoaderPanel";
 import { CategoryGroup } from "@/components/CategoryGroup";
 import { SummarySidebar } from "@/components/SummarySidebar";
+import { AddFromSourceModal } from "@/components/AddFromSourceModal";
+import { useHistory } from "@/hooks/useHistory";
 import {
   Channel, parseM3U, exportM3U, dedupeByUrl, groupByCategory,
 } from "@/lib/m3u";
@@ -32,12 +35,14 @@ import {
 } from "@/lib/supabase";
 
 export default function EditorPage() {
-  const navigate     = useNavigate();
-  const [params]     = useSearchParams();
-  const sourceId     = params.get("source");
-  const editedId     = params.get("edited"); // load from saved edited playlist
+  const navigate  = useNavigate();
+  const [params]  = useSearchParams();
+  const sourceId  = params.get("source");
+  const editedId  = params.get("edited");
 
-  const [channels,        setChannels]        = useState<Channel[]>([]);
+  // ── History (undo/redo) ───────────────────────────────────────
+  const { channels, setChannels, resetChannels, undo, redo, canUndo, canRedo } = useHistory([]);
+
   const [source,          setSource]          = useState<string>("");
   const [sourceRow,       setSourceRow]       = useState<SourcePlaylistRow | null>(null);
   const [editedRow,       setEditedRow]       = useState<EditedPlaylistRow | null>(null);
@@ -61,15 +66,32 @@ export default function EditorPage() {
   const [showSaveDialog,  setShowSaveDialog]  = useState(false);
   const [playlistName,    setPlaylistName]    = useState("");
 
-  // ── Load from saved edited playlist (dashboard → editor) ──────
+  // ── Add from source modal ─────────────────────────────────────
+  const [showAddSource,   setShowAddSource]   = useState(false);
+
+  // ── Keyboard shortcuts (Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z) ──────
+  const undoRef = useRef(undo);
+  const redoRef = useRef(redo);
+  undoRef.current = undo;
+  redoRef.current = redo;
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const mod = e.ctrlKey || e.metaKey;
+      if (!mod) return;
+      if (e.key === "z" && !e.shiftKey) { e.preventDefault(); undoRef.current(); }
+      if (e.key === "y" || (e.key === "z" && e.shiftKey)) { e.preventDefault(); redoRef.current(); }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
+  // ── Load saved edited playlist ────────────────────────────────
   useEffect(() => {
     if (!editedId) return;
     (async () => {
       const { data, error } = await supabase
-        .from("edited_playlists")
-        .select("*")
-        .eq("id", editedId)
-        .single();
+        .from("edited_playlists").select("*").eq("id", editedId).single();
       if (error || !data) { toast.error("Could not load saved playlist"); return; }
       const row = data as EditedPlaylistRow;
       setEditedRow(row);
@@ -77,8 +99,7 @@ export default function EditorPage() {
       let content = row.content;
       if (!content && row.storage_path) {
         const { data: file, error: fe } = await supabase.storage
-          .from("edited-playlists")
-          .download(row.storage_path);
+          .from("edited-playlists").download(row.storage_path);
         if (fe || !file) { toast.error("Could not download playlist file"); return; }
         content = await file.text();
       }
@@ -86,22 +107,27 @@ export default function EditorPage() {
 
       const parsed = parseM3U(content);
       if (!parsed.length) { toast.error("No channels found in saved playlist"); return; }
-      setChannels(parsed);
+      resetChannels(parsed);
       setSource(row.name);
       setPlaylistName(row.name);
+
+      // Also load the source row so "Add from source" works
+      if (row.source_playlist_id) {
+        const { data: sr } = await supabase
+          .from("source_playlists").select("*").eq("id", row.source_playlist_id).single();
+        if (sr) setSourceRow(sr as SourcePlaylistRow);
+      }
       toast.success(`Loaded "${row.name}" — ${parsed.length.toLocaleString()} channels`);
     })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editedId]);
 
-  // ── Load from source playlist (dashboard → editor) ────────────
+  // ── Load from source playlist ─────────────────────────────────
   useEffect(() => {
     if (!sourceId) return;
     (async () => {
       const { data, error } = await supabase
-        .from("source_playlists")
-        .select("*")
-        .eq("id", sourceId)
-        .single();
+        .from("source_playlists").select("*").eq("id", sourceId).single();
       if (error || !data) { toast.error("Could not load playlist"); return; }
       const row = data as SourcePlaylistRow;
       setSourceRow(row);
@@ -117,8 +143,7 @@ export default function EditorPage() {
         handleLoad(text, row.name, row);
       } else if (row.storage_path) {
         const { data: file, error: fe } = await supabase.storage
-          .from("source-playlists")
-          .download(row.storage_path);
+          .from("source-playlists").download(row.storage_path);
         if (fe || !file) { toast.error("Could not download saved playlist file"); return; }
         const text = await file.text();
         handleLoad(text, row.name, row);
@@ -127,27 +152,23 @@ export default function EditorPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sourceId]);
 
-  // ── Handle new load ───────────────────────────────────────────
+  // ── Handle new load (from LoaderPanel) ───────────────────────
   const handleLoad = useCallback(async (
     content: string,
     src: string,
     existingRow?: SourcePlaylistRow | null,
-    meta?: {
-      type: "file" | "url" | "xtream";
-      url?: string;
-      xtream_host?: string;
-      xtream_user?: string;
-    }
+    meta?: { type: "file" | "url" | "xtream"; url?: string; xtream_host?: string; xtream_user?: string; }
   ) => {
     const parsed = parseM3U(content);
     if (!parsed.length) { toast.error("No channels found in playlist"); return; }
-    setChannels(parsed);
+    resetChannels(parsed);
     setSource(src);
     setSearch("");
     setCatFilter("all");
     setDupes(0);
     setSelectedIds(new Set());
     setEditedRow(null);
+    setPlaylistName("");
 
     if (!existingRow) {
       try {
@@ -167,7 +188,7 @@ export default function EditorPage() {
     } else {
       setSourceRow(existingRow);
     }
-  }, []);
+  }, [resetChannels]);
 
   const onLoadFromPanel = useCallback((
     content: string,
@@ -179,26 +200,23 @@ export default function EditorPage() {
 
   // ── Resync ────────────────────────────────────────────────────
   const handleResync = async () => {
-    if (!sourceRow) return;
-    if (sourceRow.source_type === "file") return;
+    if (!sourceRow || sourceRow.source_type === "file") return;
     setResyncing(true);
     try {
-      let content = "";
-      if (sourceRow.source_type === "url" && sourceRow.url) {
-        const res = await fetch("/api/m3u-proxy", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: sourceRow.url }),
-        });
-        if (!res.ok) { toast.error("Could not re-fetch playlist URL"); return; }
-        content = await res.text();
-      } else {
+      if (sourceRow.source_type !== "url" || !sourceRow.url) {
         toast.error("Xtream resync requires your provider password. Please reload via the loader panel.");
         return;
       }
+      const res = await fetch("/api/m3u-proxy", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: sourceRow.url }),
+      });
+      if (!res.ok) { toast.error("Could not re-fetch playlist URL"); return; }
+      const content = await res.text();
       const parsed = parseM3U(content);
       if (!parsed.length) { toast.error("No channels found after resync"); return; }
-      setChannels(parsed);
+      resetChannels(parsed);
       setSelectedIds(new Set());
       const updated = await upsertSourcePlaylist({
         name: sourceRow.name,
@@ -217,10 +235,24 @@ export default function EditorPage() {
     }
   };
 
-  // ── Save to dashboard (named, with dialog) ────────────────────
+  // ── Add channels from source ──────────────────────────────────
+  const handleAddFromSource = (newChannels: Channel[]) => {
+    setChannels(prev => {
+      // Avoid URL dupes
+      const existingUrls = new Set(prev.map(c => c.url.trim().toLowerCase()));
+      const toAdd = newChannels.filter(c => !existingUrls.has(c.url.trim().toLowerCase()));
+      return [...prev, ...toAdd];
+    });
+  };
+
+  const existingUrls = useMemo(
+    () => new Set(channels.map(c => c.url.trim().toLowerCase())),
+    [channels]
+  );
+
+  // ── Save to dashboard ─────────────────────────────────────────
   const openSaveDialog = () => {
     if (!channels.length) return;
-    // Pre-fill name: use existing edited name, or source name
     if (!playlistName) setPlaylistName(source || "My Playlist");
     setShowSaveDialog(true);
   };
@@ -230,12 +262,10 @@ export default function EditorPage() {
     setSaving(true);
     setShowSaveDialog(false);
     try {
-      const enabled   = channels.filter(c => c.enabled);
-      const m3uText   = exportM3U(channels);
-      const name      = playlistName.trim();
+      const enabled  = channels.filter(c => c.enabled);
+      const m3uText  = exportM3U(channels);
+      const name     = playlistName.trim();
 
-      // Store inline (no storage cost for edited playlists)
-      // If content is very large (>1MB), fall back to storage
       let storagePath: string | undefined;
       let inlineContent: string | null = m3uText;
       if (m3uText.length > 900_000) {
@@ -243,24 +273,20 @@ export default function EditorPage() {
           const filename = `edited-${Date.now()}.m3u`;
           storagePath    = await uploadPlaylistFile("edited-playlists", filename, m3uText);
           inlineContent  = null;
-        } catch {
-          // keep inline if storage fails
-        }
+        } catch { /* keep inline */ }
       }
 
       if (editedRow) {
-        // Overwrite the existing saved playlist we loaded from
         await updateEditedPlaylist(editedRow.id, {
           name,
-          content:       inlineContent,
-          storage_path:  storagePath ?? editedRow.storage_path ?? null,
-          channel_count: channels.length,
-          enabled_count: enabled.length,
+          content:            inlineContent,
+          storage_path:       storagePath ?? editedRow.storage_path ?? null,
+          channel_count:      channels.length,
+          enabled_count:      enabled.length,
           source_playlist_id: sourceRow?.id ?? editedRow.source_playlist_id ?? null,
         });
         toast.success(`"${name}" updated!`);
       } else {
-        // Create a new playlist
         const newRow = await saveNewEditedPlaylist({
           source_playlist_id: sourceRow?.id ?? null,
           name,
@@ -288,19 +314,14 @@ export default function EditorPage() {
       try {
         if (useRegex) {
           const re = new RegExp(findText, "gi");
-          if (re.test(ch.name)) {
-            newName = ch.name.replace(new RegExp(findText, "gi"), replaceText);
-            count++;
-          }
+          if (re.test(ch.name)) { newName = ch.name.replace(new RegExp(findText, "gi"), replaceText); count++; }
         } else {
-          const lower = ch.name.toLowerCase();
-          const findLower = findText.toLowerCase();
-          if (lower.includes(findLower)) {
+          if (ch.name.toLowerCase().includes(findText.toLowerCase())) {
             newName = ch.name.replace(new RegExp(findText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), replaceText);
             count++;
           }
         }
-      } catch { /* invalid regex — skip */ }
+      } catch { /* invalid regex */ }
       return newName !== ch.name ? { ...ch, name: newName } : ch;
     }));
     setReplaceCount(count);
@@ -308,37 +329,35 @@ export default function EditorPage() {
     else toast.success(`Replaced ${count} channel name${count > 1 ? "s" : ""}`);
   };
 
-  // ── Bulk selection helpers ────────────────────────────────────
-  const handleSelectChange = (id: string, selected: boolean) => {
-    setSelectedIds(prev => {
-      const next = new Set(prev);
-      selected ? next.add(id) : next.delete(id);
-      return next;
-    });
-  };
+  // ── Bulk selection ────────────────────────────────────────────
+  const handleSelectChange = (id: string, selected: boolean) =>
+    setSelectedIds(prev => { const n = new Set(prev); selected ? n.add(id) : n.delete(id); return n; });
 
-  const handleSelectAllInCategory = (category: string, selected: boolean) => {
+  const handleSelectAllInCategory = (category: string, selected: boolean) =>
     setSelectedIds(prev => {
-      const next = new Set(prev);
-      channels.filter(c => c.category === category).forEach(c =>
-        selected ? next.add(c.id) : next.delete(c.id)
-      );
-      return next;
+      const n = new Set(prev);
+      channels.filter(c => c.category === category).forEach(c => selected ? n.add(c.id) : n.delete(c.id));
+      return n;
     });
-  };
 
   const handleDeleteSelected = (ids: string[]) => {
     const idSet = new Set(ids);
     setChannels(prev => prev.filter(c => !idSet.has(c.id)));
-    setSelectedIds(prev => {
-      const next = new Set(prev);
-      ids.forEach(id => next.delete(id));
-      return next;
-    });
+    setSelectedIds(prev => { const n = new Set(prev); ids.forEach(id => n.delete(id)); return n; });
     toast.success(`Deleted ${ids.length} channel${ids.length > 1 ? "s" : ""}`);
   };
 
-  const clearSelection = () => setSelectedIds(new Set());
+  // ── Reorder within category ───────────────────────────────────
+  const handleReorder = (category: string, newOrder: Channel[]) => {
+    setChannels(prev => {
+      const others = prev.filter(c => c.category !== category);
+      // Preserve the original inter-category order by splicing back at the right position
+      const firstIdx = prev.findIndex(c => c.category === category);
+      const result = [...others];
+      result.splice(firstIdx, 0, ...newOrder);
+      return result;
+    });
+  };
 
   // ── Category rename ───────────────────────────────────────────
   const handleRenameCategory = (oldName: string, newName: string) => {
@@ -351,8 +370,7 @@ export default function EditorPage() {
   };
 
   // ── Derived state ─────────────────────────────────────────────
-  const categories   = useMemo(() =>
-    Array.from(new Set(channels.map(c => c.category))).sort(), [channels]);
+  const categories = useMemo(() => Array.from(new Set(channels.map(c => c.category))).sort(), [channels]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -374,21 +392,18 @@ export default function EditorPage() {
     const { channels: cleaned, removed } = dedupeByUrl(channels);
     setChannels(cleaned);
     setDupes(p => p + removed);
-    toast.success(removed > 0
-      ? `Removed ${removed} duplicate${removed > 1 ? "s" : ""}`
-      : "No duplicates found"
-    );
+    toast.success(removed > 0 ? `Removed ${removed} duplicate${removed > 1 ? "s" : ""}` : "No duplicates found");
   };
 
-  const handleEnableAll  = (enabled: boolean) =>
-    setChannels(prev => prev.map(c => ({ ...c, enabled })));
+  const handleEnableAll  = (enabled: boolean) => setChannels(prev => prev.map(c => ({ ...c, enabled })));
   const handleToggleCat  = (cat: string, enabled: boolean) =>
     setChannels(prev => prev.map(c => c.category === cat ? { ...c, enabled } : c));
 
   const handleReset = () => {
-    setChannels([]); setSource(""); setSearch("");
-    setCatFilter("all"); setDupes(0); setSourceRow(null);
-    setEditedRow(null); setSelectedIds(new Set()); setPlaylistName("");
+    resetChannels([]);
+    setSource(""); setSearch(""); setCatFilter("all");
+    setDupes(0); setSourceRow(null); setEditedRow(null);
+    setSelectedIds(new Set()); setPlaylistName("");
   };
 
   const handleDownload = () => {
@@ -402,10 +417,8 @@ export default function EditorPage() {
   };
 
   const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(exportM3U(channels));
-      toast.success("Copied to clipboard");
-    } catch { toast.error("Clipboard unavailable"); }
+    try { await navigator.clipboard.writeText(exportM3U(channels)); toast.success("Copied to clipboard"); }
+    catch { toast.error("Clipboard unavailable"); }
   };
 
   const handleGetUrl = async () => {
@@ -418,12 +431,12 @@ export default function EditorPage() {
     } catch { toast.error("Could not generate URL"); }
   };
 
-  const canResync = sourceRow && sourceRow.source_type !== "file";
+  const canResync     = sourceRow && sourceRow.source_type !== "file";
+  const canAddSource  = !!sourceRow;
   const totalSelected = selectedIds.size;
 
   return (
     <div className="min-h-screen">
-      {/* Back to dashboard */}
       <div className="px-4 pt-6 pb-2 max-w-6xl mx-auto">
         <button
           onClick={() => navigate("/dashboard")}
@@ -473,10 +486,10 @@ export default function EditorPage() {
                   <LoaderPanel onLoad={onLoadFromPanel} />
                   <div className="mt-10 max-w-3xl mx-auto grid grid-cols-2 md:grid-cols-4 gap-3">
                     {[
-                      { t: "Edit & Rename",  d: "Rename channels & categories" },
-                      { t: "Smart Dedupe",   d: "Strip duplicate URLs" },
-                      { t: "Bulk Edit",      d: "Select, delete, find & replace" },
-                      { t: "Save & Export",  d: "Named saves to your dashboard" },
+                      { t: "Edit & Rename",   d: "Rename channels & categories" },
+                      { t: "Drag & Drop",     d: "Reorder channels within a group" },
+                      { t: "Undo / Redo",     d: "Ctrl+Z / Ctrl+Y anytime" },
+                      { t: "Save & Export",   d: "Named saves to your dashboard" },
                     ].map(f => (
                       <div key={f.t} className="bg-gradient-card ring-gold rounded-xl p-5 text-center">
                         <h4 className="font-display font-bold text-sm mb-1">{f.t}</h4>
@@ -496,26 +509,50 @@ export default function EditorPage() {
                       <div>
                         <p className="text-xs text-muted-foreground truncate max-w-[280px]">
                           {source}
-                          {editedRow && (
-                            <span className="ml-2 text-primary/70">· editing saved playlist</span>
-                          )}
+                          {editedRow && <span className="ml-2 text-primary/70">· editing saved playlist</span>}
                         </p>
                         <p className="font-display font-bold text-lg">
                           <span className="text-gradient-gold">{enabledCount}</span>
                           <span className="text-muted-foreground"> / {channels.length} enabled</span>
-                          <span className="text-muted-foreground text-sm font-normal">
-                            {" "}· {categories.length} categories
-                          </span>
+                          <span className="text-muted-foreground text-sm font-normal"> · {categories.length} categories</span>
                         </p>
                       </div>
                     </div>
                     <div className="flex gap-2 flex-wrap">
+                      {/* Undo / Redo */}
+                      <Button
+                        variant="goldOutline" size="sm"
+                        onClick={undo} disabled={!canUndo}
+                        title="Undo (Ctrl+Z)"
+                      >
+                        <Undo2 className="h-4 w-4" /> Undo
+                      </Button>
+                      <Button
+                        variant="goldOutline" size="sm"
+                        onClick={redo} disabled={!canRedo}
+                        title="Redo (Ctrl+Y)"
+                      >
+                        <Redo2 className="h-4 w-4" /> Redo
+                      </Button>
+
                       {canResync && (
-                        <Button variant="goldOutline" size="sm" onClick={handleResync} disabled={resyncing} title="Re-fetch latest channels from your provider">
+                        <Button variant="goldOutline" size="sm" onClick={handleResync} disabled={resyncing}>
                           <RefreshCw className={`h-4 w-4 ${resyncing ? "animate-spin" : ""}`} />
                           {resyncing ? "Syncing…" : "Resync"}
                         </Button>
                       )}
+
+                      {/* Add from source */}
+                      {canAddSource && (
+                        <Button
+                          variant="goldOutline" size="sm"
+                          onClick={() => setShowAddSource(true)}
+                          title="Browse your source playlist and add channels"
+                        >
+                          <Plus className="h-4 w-4" /> Add Channels
+                        </Button>
+                      )}
+
                       <Button variant="goldOutline" size="sm" onClick={() => handleEnableAll(true)}>
                         <ToggleLeft className="h-4 w-4" /> Enable all
                       </Button>
@@ -568,12 +605,7 @@ export default function EditorPage() {
                       </div>
                       <div className="flex items-center gap-4">
                         <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer select-none">
-                          <input
-                            type="checkbox"
-                            checked={useRegex}
-                            onChange={e => setUseRegex(e.target.checked)}
-                            className="h-3.5 w-3.5 accent-primary"
-                          />
+                          <input type="checkbox" checked={useRegex} onChange={e => setUseRegex(e.target.checked)} className="h-3.5 w-3.5 accent-primary" />
                           Use regex
                         </label>
                         {replaceCount !== null && replaceCount > 0 && (
@@ -597,7 +629,7 @@ export default function EditorPage() {
                         <Button variant="goldOutline" size="sm" onClick={() => handleDeleteSelected(Array.from(selectedIds))}>
                           <Trash2 className="h-4 w-4" /> Delete selected
                         </Button>
-                        <Button variant="goldOutline" size="sm" onClick={clearSelection}>
+                        <Button variant="goldOutline" size="sm" onClick={() => setSelectedIds(new Set())}>
                           <X className="h-4 w-4" /> Clear
                         </Button>
                       </div>
@@ -628,7 +660,7 @@ export default function EditorPage() {
                     </Select>
                   </div>
 
-                  {/* Groups */}
+                  {/* Channel groups */}
                   <div className="space-y-4">
                     {groupKeys.length === 0 ? (
                       <div className="bg-gradient-card ring-gold rounded-2xl p-12 text-center text-muted-foreground">
@@ -649,12 +681,13 @@ export default function EditorPage() {
                           onSelectChange={handleSelectChange}
                           onSelectAllInCategory={handleSelectAllInCategory}
                           onDeleteSelected={handleDeleteSelected}
+                          onReorder={handleReorder}
                         />
                       ))
                     )}
                   </div>
 
-                  {/* Export bar (sticky) */}
+                  {/* Export / save bar */}
                   <div className="sticky bottom-0 z-30">
                     <div className="bg-gradient-card ring-gold rounded-2xl p-4 md:p-5 shadow-gold backdrop-blur-md flex flex-wrap gap-3 justify-between items-center">
                       <p className="text-sm">
@@ -686,7 +719,7 @@ export default function EditorPage() {
         </div>
       </SidebarProvider>
 
-      {/* ── Save / name dialog ──────────────────────────────────── */}
+      {/* Save dialog */}
       <Dialog open={showSaveDialog} onOpenChange={setShowSaveDialog}>
         <DialogContent className="bg-gradient-card border-border">
           <DialogHeader>
@@ -695,9 +728,7 @@ export default function EditorPage() {
             </DialogTitle>
           </DialogHeader>
           <div className="py-2 space-y-3">
-            <label className="block text-xs text-muted-foreground uppercase tracking-widest mb-1.5">
-              Playlist name
-            </label>
+            <label className="block text-xs text-muted-foreground uppercase tracking-widest mb-1.5">Playlist name</label>
             <Input
               autoFocus
               placeholder="e.g. Sports Channels, My IPTV…"
@@ -713,9 +744,7 @@ export default function EditorPage() {
             </p>
           </div>
           <DialogFooter className="gap-2">
-            <Button variant="goldOutline" onClick={() => setShowSaveDialog(false)}>
-              Cancel
-            </Button>
+            <Button variant="goldOutline" onClick={() => setShowSaveDialog(false)}>Cancel</Button>
             <Button variant="gold" onClick={handleSaveToDashboard} disabled={!playlistName.trim()}>
               <Save className="h-4 w-4" />
               {editedRow ? "Update" : "Save"}
@@ -723,6 +752,15 @@ export default function EditorPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Add from source modal */}
+      <AddFromSourceModal
+        open={showAddSource}
+        onClose={() => setShowAddSource(false)}
+        sourcePlaylistId={sourceRow?.id ?? editedRow?.source_playlist_id ?? null}
+        existingUrls={existingUrls}
+        onAdd={handleAddFromSource}
+      />
     </div>
   );
 }
