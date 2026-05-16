@@ -1,9 +1,133 @@
 import { useState } from "react";
-import { ChevronDown, Pencil, Check, X, Trash2 } from "lucide-react";
+import { ChevronDown, Pencil, Check, X, Trash2, GripVertical } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  useSortable,
+  verticalListSortingStrategy,
+  arrayMove,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { Channel } from "@/lib/m3u";
 import { cn } from "@/lib/utils";
+
+// ── Sortable channel row ──────────────────────────────────────────────────
+
+function SortableChannelRow({
+  ch,
+  isSelected,
+  isEditing,
+  draft,
+  onDraftChange,
+  onStartEdit,
+  onCommitEdit,
+  onCancelEdit,
+  onToggle,
+  onSelectChange,
+}: {
+  ch: Channel;
+  isSelected: boolean;
+  isEditing: boolean;
+  draft: string;
+  onDraftChange: (v: string) => void;
+  onStartEdit: () => void;
+  onCommitEdit: () => void;
+  onCancelEdit: () => void;
+  onToggle: (enabled: boolean) => void;
+  onSelectChange: (selected: boolean) => void;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: ch.id });
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    zIndex: isDragging ? 50 : undefined,
+    opacity: isDragging ? 0.85 : 1,
+  };
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      className={cn(
+        "flex items-center gap-3 px-4 py-3 transition-colors",
+        isSelected ? "bg-primary/5" : "",
+        ch.enabled ? "opacity-100" : "opacity-50",
+        isDragging ? "shadow-elegant ring-1 ring-primary/30 rounded-xl bg-card" : ""
+      )}
+    >
+      {/* Drag handle */}
+      <button
+        {...attributes}
+        {...listeners}
+        className="touch-none cursor-grab active:cursor-grabbing text-muted-foreground/40 hover:text-muted-foreground transition-colors flex-shrink-0"
+        tabIndex={-1}
+        aria-label="Drag to reorder"
+      >
+        <GripVertical className="h-4 w-4" />
+      </button>
+
+      {/* Checkbox */}
+      <input
+        type="checkbox"
+        checked={isSelected}
+        onChange={e => onSelectChange(e.target.checked)}
+        className="h-4 w-4 rounded border-border accent-primary cursor-pointer flex-shrink-0"
+      />
+
+      <Switch checked={ch.enabled} onCheckedChange={onToggle} />
+
+      <div className="flex-1 min-w-0">
+        {isEditing ? (
+          <div className="flex items-center gap-2">
+            <Input
+              autoFocus
+              value={draft}
+              onChange={e => onDraftChange(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === "Enter") onCommitEdit();
+                if (e.key === "Escape") onCancelEdit();
+              }}
+              className="h-8 bg-background/60"
+            />
+            <button onClick={onCommitEdit} className="text-primary hover:text-primary-glow">
+              <Check className="h-4 w-4" />
+            </button>
+            <button onClick={onCancelEdit} className="text-muted-foreground hover:text-foreground">
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 group">
+            <span className="truncate text-sm font-medium">{ch.name}</span>
+            {ch.name !== ch.originalName && (
+              <span className="text-[10px] uppercase tracking-wider text-primary/70">edited</span>
+            )}
+            <button
+              onClick={onStartEdit}
+              className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-primary transition-smooth"
+              title="Rename"
+            >
+              <Pencil className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── CategoryGroup ─────────────────────────────────────────────────────────
 
 interface Props {
   category: string;
@@ -17,6 +141,7 @@ interface Props {
   onSelectChange: (id: string, selected: boolean) => void;
   onSelectAllInCategory: (category: string, selected: boolean) => void;
   onDeleteSelected: (ids: string[]) => void;
+  onReorder: (category: string, newOrder: Channel[]) => void;
 }
 
 export const CategoryGroup = ({
@@ -31,14 +156,19 @@ export const CategoryGroup = ({
   onSelectChange,
   onSelectAllInCategory,
   onDeleteSelected,
+  onReorder,
 }: Props) => {
-  const [open, setOpen] = useState(defaultOpen);
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [draft, setDraft] = useState("");
+  const [open,       setOpen]       = useState(defaultOpen);
+  const [editingId,  setEditingId]  = useState<string | null>(null);
+  const [draft,      setDraft]      = useState("");
   const [editingCat, setEditingCat] = useState(false);
-  const [catDraft, setCatDraft] = useState("");
+  const [catDraft,   setCatDraft]   = useState("");
 
-  const enabledCount = channels.filter((c) => c.enabled).length;
+  const sensors = useSensors(useSensor(PointerSensor, {
+    activationConstraint: { distance: 6 },
+  }));
+
+  const enabledCount = channels.filter(c => c.enabled).length;
   const allEnabled   = enabledCount === channels.length;
 
   const categorySelectedIds = channels.map(c => c.id).filter(id => selectedIds.has(id));
@@ -46,8 +176,8 @@ export const CategoryGroup = ({
   const someCatSelected = categorySelectedIds.length > 0;
 
   // ── Channel rename ────────────────────────────────────────────
-  const startEdit = (ch: Channel) => { setEditingId(ch.id); setDraft(ch.name); };
-  const commitEdit = () => {
+  const startEdit   = (ch: Channel) => { setEditingId(ch.id); setDraft(ch.name); };
+  const commitEdit  = () => {
     if (editingId && draft.trim()) onRename(editingId, draft.trim());
     setEditingId(null);
   };
@@ -61,14 +191,22 @@ export const CategoryGroup = ({
   };
   const commitCatEdit = (e?: React.MouseEvent) => {
     e?.stopPropagation();
-    if (catDraft.trim() && catDraft.trim() !== category) {
-      onRenameCategory(category, catDraft.trim());
-    }
+    if (catDraft.trim() && catDraft.trim() !== category) onRenameCategory(category, catDraft.trim());
     setEditingCat(false);
   };
   const cancelCatEdit = (e: React.MouseEvent) => {
     e.stopPropagation();
     setEditingCat(false);
+  };
+
+  // ── Drag end ──────────────────────────────────────────────────
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const oldIdx = channels.findIndex(c => c.id === active.id);
+    const newIdx = channels.findIndex(c => c.id === over.id);
+    if (oldIdx === -1 || newIdx === -1) return;
+    onReorder(category, arrayMove(channels, oldIdx, newIdx));
   };
 
   return (
@@ -78,7 +216,7 @@ export const CategoryGroup = ({
         className="w-full flex items-center gap-3 px-4 py-4 hover:bg-primary/5 transition-smooth text-left cursor-pointer"
         onClick={() => !editingCat && setOpen(o => !o)}
       >
-        {/* Bulk-select checkbox for entire category */}
+        {/* Category checkbox */}
         <div onClick={e => e.stopPropagation()}>
           <input
             type="checkbox"
@@ -89,14 +227,12 @@ export const CategoryGroup = ({
           />
         </div>
 
-        <ChevronDown
-          className={cn(
-            "h-5 w-5 text-primary transition-transform flex-shrink-0",
-            open ? "rotate-0" : "-rotate-90"
-          )}
-        />
+        <ChevronDown className={cn(
+          "h-5 w-5 text-primary transition-transform flex-shrink-0",
+          open ? "rotate-0" : "-rotate-90"
+        )} />
 
-        {/* Category name / rename field */}
+        {/* Name / rename field */}
         <div className="flex-1 min-w-0" onClick={e => editingCat && e.stopPropagation()}>
           {editingCat ? (
             <div className="flex items-center gap-2">
@@ -120,9 +256,7 @@ export const CategoryGroup = ({
             </div>
           ) : (
             <div className="flex items-center gap-2 group/cat">
-              <h3 className="font-display font-bold text-base md:text-lg truncate">
-                {category}
-              </h3>
+              <h3 className="font-display font-bold text-base md:text-lg truncate">{category}</h3>
               <button
                 onClick={startCatEdit}
                 className="opacity-0 group-hover/cat:opacity-100 text-muted-foreground hover:text-primary transition-smooth flex-shrink-0"
@@ -140,92 +274,53 @@ export const CategoryGroup = ({
           </p>
         </div>
 
-        {/* Bulk delete selected in category */}
-        {someCatSelected && (
+        {/* Bulk delete */}
+        {someCatSelected ? (
           <button
             onClick={e => { e.stopPropagation(); onDeleteSelected(categorySelectedIds); }}
             className="px-2.5 py-1.5 rounded-full text-xs font-medium border border-destructive/30 text-destructive hover:bg-destructive/10 transition-smooth flex items-center gap-1 flex-shrink-0"
-            title="Delete selected"
           >
-            <Trash2 className="h-3 w-3" />
-            Delete {categorySelectedIds.length}
+            <Trash2 className="h-3 w-3" /> Delete {categorySelectedIds.length}
           </button>
-        )}
-
-        {/* Toggle all in category */}
-        {!someCatSelected && (
+        ) : (
           <div
             onClick={e => { e.stopPropagation(); onToggleAll(category, !allEnabled); }}
-            className="px-3 py-1.5 rounded-full text-xs font-medium border border-primary/30 text-primary hover:bg-primary/10 transition-smooth flex-shrink-0"
+            className="px-3 py-1.5 rounded-full text-xs font-medium border border-primary/30 text-primary hover:bg-primary/10 transition-smooth flex-shrink-0 cursor-pointer"
           >
             {allEnabled ? "Disable all" : "Enable all"}
           </div>
         )}
       </div>
 
-      {/* ── Channel rows ────────────────────────────────────────── */}
+      {/* ── Channel rows with DnD ────────────────────────────────── */}
       {open && (
         <div className="border-t border-border/50 divide-y divide-border/40">
-          {channels.map((ch) => (
-            <div
-              key={ch.id}
-              className={cn(
-                "flex items-center gap-3 px-4 py-3 transition-smooth",
-                selectedIds.has(ch.id) ? "bg-primary/5" : "",
-                ch.enabled ? "opacity-100" : "opacity-50"
-              )}
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            onDragEnd={handleDragEnd}
+          >
+            <SortableContext
+              items={channels.map(c => c.id)}
+              strategy={verticalListSortingStrategy}
             >
-              {/* Row checkbox */}
-              <input
-                type="checkbox"
-                checked={selectedIds.has(ch.id)}
-                onChange={e => onSelectChange(ch.id, e.target.checked)}
-                className="h-4 w-4 rounded border-border accent-primary cursor-pointer flex-shrink-0"
-              />
-
-              <Switch
-                checked={ch.enabled}
-                onCheckedChange={(v) => onToggle(ch.id, v)}
-              />
-
-              <div className="flex-1 min-w-0">
-                {editingId === ch.id ? (
-                  <div className="flex items-center gap-2">
-                    <Input
-                      autoFocus
-                      value={draft}
-                      onChange={(e) => setDraft(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") commitEdit();
-                        if (e.key === "Escape") setEditingId(null);
-                      }}
-                      className="h-8 bg-background/60"
-                    />
-                    <button onClick={commitEdit} className="text-primary hover:text-primary-glow">
-                      <Check className="h-4 w-4" />
-                    </button>
-                    <button onClick={() => setEditingId(null)} className="text-muted-foreground hover:text-foreground">
-                      <X className="h-4 w-4" />
-                    </button>
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-2 group">
-                    <span className="truncate text-sm font-medium">{ch.name}</span>
-                    {ch.name !== ch.originalName && (
-                      <span className="text-[10px] uppercase tracking-wider text-primary/70">edited</span>
-                    )}
-                    <button
-                      onClick={() => startEdit(ch)}
-                      className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-primary transition-smooth"
-                      title="Rename"
-                    >
-                      <Pencil className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                )}
-              </div>
-            </div>
-          ))}
+              {channels.map(ch => (
+                <SortableChannelRow
+                  key={ch.id}
+                  ch={ch}
+                  isSelected={selectedIds.has(ch.id)}
+                  isEditing={editingId === ch.id}
+                  draft={draft}
+                  onDraftChange={setDraft}
+                  onStartEdit={() => startEdit(ch)}
+                  onCommitEdit={commitEdit}
+                  onCancelEdit={() => setEditingId(null)}
+                  onToggle={v => onToggle(ch.id, v)}
+                  onSelectChange={s => onSelectChange(ch.id, s)}
+                />
+              ))}
+            </SortableContext>
+          </DndContext>
         </div>
       )}
     </div>
