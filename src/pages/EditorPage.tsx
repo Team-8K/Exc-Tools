@@ -20,7 +20,6 @@ import { toast } from "sonner";
 import { LoaderPanel } from "@/components/LoaderPanel";
 import { CategoryGroup } from "@/components/CategoryGroup";
 import { SummarySidebar } from "@/components/SummarySidebar";
-import { AddFromSourceModal } from "@/components/AddFromSourceModal";
 import { useHistory } from "@/hooks/useHistory";
 import {
   Channel, parseM3U, exportM3U, dedupeByUrl, groupByCategory,
@@ -31,7 +30,8 @@ import {
   updateEditedPlaylist,
   uploadPlaylistFile,
   upsertSourcePlaylist,
-  getOrCreateSharedUrl,
+  listEditedPlaylists,
+  createPlaylistSignedUrl,
   type SourcePlaylistRow,
   type EditedPlaylistRow,
 } from "@/lib/supabase";
@@ -67,9 +67,8 @@ export default function EditorPage() {
   // ── Save dialog ───────────────────────────────────────────────
   const [showSaveDialog,  setShowSaveDialog]  = useState(false);
   const [playlistName,    setPlaylistName]    = useState("");
-
-  // ── Add from source modal ─────────────────────────────────────
-  const [showAddSource,   setShowAddSource]   = useState(false);
+  const [existingList,    setExistingList]    = useState<EditedPlaylistRow[]>([]);
+  const [overwriteTarget, setOverwriteTarget] = useState<string>("new"); // "new" | row id
 
   // ── Keyboard shortcuts (Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z) ──────
   const undoRef = useRef(undo);
@@ -253,9 +252,31 @@ export default function EditorPage() {
   );
 
   // ── Save to dashboard ─────────────────────────────────────────
-  const openSaveDialog = () => {
+  const openSaveDialog = async () => {
     if (!channels.length) return;
     if (!playlistName) setPlaylistName(source || "My Playlist");
+
+    // Load current edited playlists to check the cap
+    try {
+      const rows = await listEditedPlaylists();
+      setExistingList(rows);
+      // If editing an existing one, no cap check needed
+      if (!editedRow) {
+        // Filter out the one we're currently editing (shouldn't exist, but safety)
+        const others = rows.filter(r => r.id !== editedRow);
+        if (others.length >= 2) {
+          // At cap — force overwrite selection, default to oldest
+          setOverwriteTarget(others[others.length - 1].id);
+        } else {
+          setOverwriteTarget("new");
+        }
+      } else {
+        setOverwriteTarget(editedRow.id);
+      }
+    } catch {
+      setExistingList([]);
+      setOverwriteTarget(editedRow?.id ?? "new");
+    }
     setShowSaveDialog(true);
   };
 
@@ -264,36 +285,40 @@ export default function EditorPage() {
     setSaving(true);
     setShowSaveDialog(false);
     try {
-      const enabled  = channels.filter(c => c.enabled);
-      const m3uText  = exportM3U(channels);
-      const name     = playlistName.trim();
+      const enabled = channels.filter(c => c.enabled);
+      const m3uText = exportM3U(channels);
+      const name    = playlistName.trim();
 
-      let storagePath: string | undefined;
-      let inlineContent: string | null = m3uText;
-      if (m3uText.length > 900_000) {
-        try {
-          const filename = `edited-${Date.now()}.m3u`;
-          storagePath    = await uploadPlaylistFile("edited-playlists", filename, m3uText);
-          inlineContent  = null;
-        } catch { /* keep inline */ }
-      }
+      // Always upload to storage so Get Player URL always works
+      const filename    = `edited-${Date.now()}.m3u`;
+      const storagePath = await uploadPlaylistFile("edited-playlists", filename, m3uText);
 
-      if (editedRow) {
-        await updateEditedPlaylist(editedRow.id, {
+      // Determine target row: overwrite existing or create new
+      const targetId = overwriteTarget !== "new" ? overwriteTarget : editedRow?.id ?? null;
+
+      if (targetId) {
+        // Overwrite existing row — delete old storage file first to save space
+        const existing = existingList.find(r => r.id === targetId) ?? editedRow;
+        if (existing?.storage_path && existing.storage_path !== storagePath) {
+          await supabase.storage.from("edited-playlists").remove([existing.storage_path]);
+        }
+        const updated = await updateEditedPlaylist(targetId, {
           name,
-          content:            inlineContent,
-          storage_path:       storagePath ?? editedRow.storage_path ?? null,
+          content:            null,   // always use storage_path, not inline
+          storage_path:       storagePath,
           channel_count:      channels.length,
           enabled_count:      enabled.length,
-          source_playlist_id: sourceRow?.id ?? editedRow.source_playlist_id ?? null,
+          source_playlist_id: sourceRow?.id ?? (existing as any)?.source_playlist_id ?? null,
         });
+        setEditedRow(updated);
         toast.success(`"${name}" updated!`);
       } else {
+        // Create new row
         const newRow = await saveNewEditedPlaylist({
           source_playlist_id: sourceRow?.id ?? null,
           name,
-          content:       inlineContent,
-          storage_path:  storagePath ?? null,
+          content:       null,
+          storage_path:  storagePath,
           channel_count: channels.length,
           enabled_count: enabled.length,
         });
@@ -427,19 +452,20 @@ export default function EditorPage() {
 
   const handleGetUrl = async () => {
     if (!editedRow) {
-      toast.error("Save your playlist to the dashboard first, then you can get a shareable URL.");
+      toast.error("Save your playlist to the dashboard first, then you can get a player URL.");
+      return;
+    }
+    if (!editedRow.storage_path) {
+      toast.error("Re-save your playlist in the editor and try again.");
       return;
     }
     setGeneratingUrl(true);
     try {
-      const base = window.location.origin;
-      const url  = await getOrCreateSharedUrl(editedRow.id, base);
+      const url = await createPlaylistSignedUrl(editedRow.storage_path);
       await navigator.clipboard.writeText(url);
-      toast.success("Playlist URL copied — paste it directly into TiviMate or any M3U player!", {
-        duration: 5000,
-      });
+      toast.success("Player URL copied! Paste it into TiviMate or any M3U player.", { duration: 5000 });
     } catch (err: any) {
-      toast.error(err?.message || "Could not generate URL");
+      toast.error(err?.message || "Could not generate player URL");
     } finally {
       setGeneratingUrl(false);
     }
@@ -711,7 +737,7 @@ export default function EditorPage() {
                               variant="goldOutline"
                               onClick={handleGetUrl}
                               disabled={generatingUrl}
-                              title="Get a short URL to use directly in TiviMate or any M3U player"
+                              title="Copy a URL to use directly in TiviMate or any M3U player"
                             >
                               <Share2 className="h-4 w-4" />
                               {generatingUrl ? "Generating…" : "Get Player URL"}
@@ -732,7 +758,7 @@ export default function EditorPage() {
         </div>
       </SidebarProvider>
 
-      {/* Save dialog */}
+      {/* ── Save / name dialog ─────────────────────────────────── */}
       <Dialog open={showSaveDialog} onOpenChange={setShowSaveDialog}>
         <DialogContent className="bg-gradient-card border-border">
           <DialogHeader>
@@ -740,40 +766,77 @@ export default function EditorPage() {
               {editedRow ? "Update Playlist" : "Save Playlist"}
             </DialogTitle>
           </DialogHeader>
-          <div className="py-2 space-y-3">
-            <label className="block text-xs text-muted-foreground uppercase tracking-widest mb-1.5">Playlist name</label>
-            <Input
-              autoFocus
-              placeholder="e.g. Sports Channels, My IPTV…"
-              value={playlistName}
-              onChange={e => setPlaylistName(e.target.value)}
-              onKeyDown={e => e.key === "Enter" && handleSaveToDashboard()}
-              className="bg-background/60 border-border focus-visible:ring-primary"
-            />
+          <div className="py-2 space-y-4">
+            <div>
+              <label className="block text-xs text-muted-foreground uppercase tracking-widest mb-1.5">Playlist name</label>
+              <Input
+                autoFocus
+                placeholder="e.g. Sports Channels, My IPTV…"
+                value={playlistName}
+                onChange={e => setPlaylistName(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && handleSaveToDashboard()}
+                className="bg-background/60 border-border focus-visible:ring-primary"
+              />
+            </div>
+
+            {/* Overwrite selector — shown when user has 2 playlists already and isn't editing one */}
+            {!editedRow && existingList.length >= 2 && (
+              <div>
+                <label className="block text-xs text-muted-foreground uppercase tracking-widest mb-2">
+                  You already have 2 saved playlists. Choose one to replace:
+                </label>
+                <div className="space-y-2">
+                  {existingList.map(row => (
+                    <label
+                      key={row.id}
+                      className={`flex items-center gap-3 px-4 py-3 rounded-xl border cursor-pointer transition-all ${
+                        overwriteTarget === row.id
+                          ? "border-primary bg-primary/10"
+                          : "border-border hover:border-primary/40"
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        name="overwrite"
+                        value={row.id}
+                        checked={overwriteTarget === row.id}
+                        onChange={() => setOverwriteTarget(row.id)}
+                        className="accent-primary"
+                      />
+                      <div>
+                        <p className="text-sm font-medium">{row.name}</p>
+                        <p className="text-xs text-muted-foreground">
+                          {row.enabled_count.toLocaleString()} channels · saved {new Date(row.updated_at).toLocaleDateString()}
+                        </p>
+                      </div>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+
             <p className="text-xs text-muted-foreground">
               {editedRow
                 ? `This will overwrite "${editedRow.name}" in your dashboard.`
+                : existingList.length >= 2
+                ? "The selected playlist above will be replaced with your current edits."
                 : `${enabledCount} of ${channels.length} channels will be saved.`}
             </p>
           </div>
           <DialogFooter className="gap-2">
             <Button variant="goldOutline" onClick={() => setShowSaveDialog(false)}>Cancel</Button>
-            <Button variant="gold" onClick={handleSaveToDashboard} disabled={!playlistName.trim()}>
+            <Button
+              variant="gold"
+              onClick={handleSaveToDashboard}
+              disabled={!playlistName.trim() || (!editedRow && existingList.length >= 2 && overwriteTarget === "new")}
+            >
               <Save className="h-4 w-4" />
-              {editedRow ? "Update" : "Save"}
+              {editedRow ? "Update" : existingList.length >= 2 ? "Replace & Save" : "Save"}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
-      {/* Add from source modal */}
-      <AddFromSourceModal
-        open={showAddSource}
-        onClose={() => setShowAddSource(false)}
-        sourcePlaylistId={sourceRow?.id ?? editedRow?.source_playlist_id ?? null}
-        existingUrls={existingUrls}
-        onAdd={handleAddFromSource}
-      />
     </div>
   );
 }
