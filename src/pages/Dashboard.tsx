@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Plus, Trash2, Edit3, Download, Clock,
-  ListMusic, ChevronRight, RefreshCw, FileMusic, Globe, Tv,
+  ListMusic, ChevronRight, RefreshCw, FileMusic, Globe, Tv, Share2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
@@ -10,6 +10,7 @@ import {
   supabase,
   listEditedPlaylists,
   deleteEditedPlaylist,
+  createPlaylistSignedUrl,
   type SourcePlaylistRow,
   type EditedPlaylistRow,
 } from "@/lib/supabase";
@@ -104,6 +105,26 @@ export default function Dashboard() {
       toast.success(`"${row.name}" deleted`);
     } catch (err: any) {
       toast.error(err?.message || "Delete failed");
+    }
+  };
+
+  // ── Get Player URL (signed URL, 1-year expiry) ───────────────
+  const [generatingUrlId, setGeneratingUrlId] = useState<string | null>(null);
+
+  const handleGetPlayerUrl = async (row: EditedPlaylistRow) => {
+    if (!row.storage_path) {
+      toast.error("Open this playlist in the Editor, re-save it, then try again.");
+      return;
+    }
+    setGeneratingUrlId(row.id);
+    try {
+      const url = await createPlaylistSignedUrl(row.storage_path);
+      await navigator.clipboard.writeText(url);
+      toast.success("Player URL copied! Paste it into TiviMate or any M3U player.", { duration: 5000 });
+    } catch (err: any) {
+      toast.error(err?.message || "Could not generate player URL");
+    } finally {
+      setGeneratingUrlId(null);
     }
   };
 
@@ -352,6 +373,15 @@ export default function Dashboard() {
                         Open in Editor
                       </button>
                       <button
+                        onClick={() => handleGetPlayerUrl(row)}
+                        disabled={generatingUrlId === row.id}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-primary/30 text-primary hover:bg-primary/10 transition-all disabled:opacity-50"
+                        title="Copy a URL to use in TiviMate or any M3U player"
+                      >
+                        <Share2 className="h-3.5 w-3.5" />
+                        {generatingUrlId === row.id ? "Generating…" : "Get Player URL"}
+                      </button>
+                      <button
                         onClick={() => handleDownloadEdited(row)}
                         className="p-2 rounded-lg hover:bg-primary/10 text-muted-foreground hover:text-primary transition-all"
                         title="Download M3U"
@@ -373,6 +403,7 @@ export default function Dashboard() {
           </section>
         </div>
       )}
+
     </div>
   );
 }
