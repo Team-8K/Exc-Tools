@@ -20,6 +20,7 @@ import { toast } from "sonner";
 import { LoaderPanel } from "@/components/LoaderPanel";
 import { CategoryGroup } from "@/components/CategoryGroup";
 import { SummarySidebar } from "@/components/SummarySidebar";
+import { AddFromSourceModal } from "@/components/AddFromSourceModal";
 import { useHistory } from "@/hooks/useHistory";
 import {
   Channel, parseM3U, exportM3U, dedupeByUrl, groupByCategory,
@@ -68,7 +69,10 @@ export default function EditorPage() {
   const [showSaveDialog,  setShowSaveDialog]  = useState(false);
   const [playlistName,    setPlaylistName]    = useState("");
   const [existingList,    setExistingList]    = useState<EditedPlaylistRow[]>([]);
-  const [overwriteTarget, setOverwriteTarget] = useState<string>("new"); // "new" | row id
+  const [overwriteTarget, setOverwriteTarget] = useState<string>("new");
+
+  // ── Add from source modal ─────────────────────────────────────
+  const [showAddSource,   setShowAddSource]   = useState(false);
 
   // ── Keyboard shortcuts (Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z) ──────
   const undoRef = useRef(undo);
@@ -587,6 +591,11 @@ export default function EditorPage() {
                       <Button variant="goldOutline" size="sm" onClick={() => handleEnableAll(false)}>
                         Disable all
                       </Button>
+                      {sourceRow && (
+                        <Button variant="goldOutline" size="sm" onClick={() => setShowAddSource(true)} title="Browse your source playlist and add channels">
+                          <Plus className="h-4 w-4" /> Add Channels
+                        </Button>
+                      )}
                       <Button variant="goldOutline" size="sm" onClick={handleDedupe}>
                         <Trash2 className="h-4 w-4" /> Dedupe
                       </Button>
@@ -836,6 +845,15 @@ export default function EditorPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Add from source modal */}
+      <AddFromSourceModal
+        open={showAddSource}
+        onClose={() => setShowAddSource(false)}
+        sourcePlaylistId={sourceRow?.id ?? editedRow?.source_playlist_id ?? null}
+        existingUrls={existingUrls}
+        onAdd={handleAddFromSource}
+      />
 
     </div>
   );
